@@ -1,5 +1,6 @@
 /**
- * Copyright (c) 2010-2018 by the respective copyright holders.
+ * Copyright (c) 2014-2016 by the respective copyright holders.
+ *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v1.0
  * which accompanies this distribution, and is available at
@@ -9,6 +10,7 @@ package org.openhab.binding.zwave.internal.protocol.commandclass;
 
 import static org.openhab.binding.zwave.internal.protocol.commandclass.ZWaveCommandClass.CommandClass.*;
 
+import java.io.ByteArrayOutputStream;
 import java.io.UnsupportedEncodingException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -16,14 +18,15 @@ import java.util.Collection;
 import java.util.HashSet;
 import java.util.Set;
 
+import org.openhab.binding.zwave.internal.protocol.SerialMessage;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage.SerialMessageClass;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage.SerialMessagePriority;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage.SerialMessageType;
 import org.openhab.binding.zwave.internal.protocol.ZWaveAssociationGroup;
-import org.openhab.binding.zwave.internal.protocol.ZWaveCommandClassPayload;
 import org.openhab.binding.zwave.internal.protocol.ZWaveController;
 import org.openhab.binding.zwave.internal.protocol.ZWaveEndpoint;
 import org.openhab.binding.zwave.internal.protocol.ZWaveNode;
-import org.openhab.binding.zwave.internal.protocol.ZWaveTransaction.TransactionPriority;
-import org.openhab.binding.zwave.internal.protocol.transaction.ZWaveCommandClassTransactionPayload;
-import org.openhab.binding.zwave.internal.protocol.transaction.ZWaveCommandClassTransactionPayloadBuilder;
+import org.openhab.binding.zwave.internal.protocol.ZWaveSerialMessageException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -37,12 +40,12 @@ import com.thoughtworks.xstream.annotations.XStreamOmitField;
  * @author Jorg de Jong
  * @author Chris Jackson
  */
-@XStreamAlias("COMMAND_CLASS_ASSOCIATION_GRP_INFO")
+@XStreamAlias("associationGroupInfoCommandClass")
 public class ZWaveAssociationGroupInfoCommandClass extends ZWaveCommandClass
         implements ZWaveCommandClassInitialization {
 
     @XStreamOmitField
-    private static final Logger logger = LoggerFactory.getLogger(ZWaveAssociationGroupInfoCommandClass.class);
+    private final static Logger logger = LoggerFactory.getLogger(ZWaveAssociationGroupInfoCommandClass.class);
 
     private static final byte ASSOCIATION_GROUP_INFO_NAME_GET = 1;
     private static final byte ASSOCIATION_GROUP_INFO_NAME_REPORT = 2;
@@ -51,7 +54,7 @@ public class ZWaveAssociationGroupInfoCommandClass extends ZWaveCommandClass
     private static final byte ASSOCIATION_GROUP_INFO_LIST_GET = 5;
     private static final byte ASSOCIATION_GROUP_INFO_LIST_REPORT = 6;
 
-    private static final int MAX_STRING_LENGTH = 42;
+    private static final int MAX_STRING_LENGTH = 25;
 
     private static final int GET_LISTMODE_MASK = 0x40;
     // not used private static final int GET_REFRESHCACHE_MASK = 0x80;
@@ -69,13 +72,10 @@ public class ZWaveAssociationGroupInfoCommandClass extends ZWaveCommandClass
 
     // List of command classes that are eligible for auto subscription.
     @XStreamOmitField
-    private Set<CommandClass> autoCCs = ImmutableSet.of(COMMAND_CLASS_DEVICE_RESET_LOCALLY, COMMAND_CLASS_BATTERY,
-            COMMAND_CLASS_CONFIGURATION, COMMAND_CLASS_METER, COMMAND_CLASS_THERMOSTAT_OPERATING_STATE,
-            COMMAND_CLASS_THERMOSTAT_MODE, COMMAND_CLASS_THERMOSTAT_FAN_MODE, COMMAND_CLASS_SENSOR_MULTILEVEL,
-            COMMAND_CLASS_SENSOR_ALARM, COMMAND_CLASS_THERMOSTAT_FAN_STATE, COMMAND_CLASS_THERMOSTAT_SETPOINT,
-            COMMAND_CLASS_SENSOR_BINARY, COMMAND_CLASS_ALARM, COMMAND_CLASS_SWITCH_COLOR,
-            COMMAND_CLASS_SCENE_ACTIVATION, COMMAND_CLASS_CENTRAL_SCENE, COMMAND_CLASS_DOOR_LOCK,
-            COMMAND_CLASS_METER_TBL_MONITOR, COMMAND_CLASS_METER_PULSE);
+    private Set<CommandClass> autoCCs = ImmutableSet.of(DEVICE_RESET_LOCALLY, BATTERY, CONFIGURATION, METER,
+            THERMOSTAT_OPERATING_STATE, THERMOSTAT_MODE, THERMOSTAT_FAN_MODE, SENSOR_MULTILEVEL, SENSOR_ALARM,
+            THERMOSTAT_FAN_STATE, THERMOSTAT_SETPOINT, SENSOR_BINARY, ALARM, COLOR, SCENE_ACTIVATION, CENTRAL_SCENE,
+            DOOR_LOCK, METER_TBL_MONITOR, METER_PULSE);
 
     /**
      * Creates a new instance of the ZwaveAssociationGroupInfoCommandClass class.
@@ -91,19 +91,51 @@ public class ZWaveAssociationGroupInfoCommandClass extends ZWaveCommandClass
         super(node, controller, endpoint);
     }
 
+    /**
+     * {@inheritDoc}
+     */
     @Override
     public CommandClass getCommandClass() {
-        return CommandClass.COMMAND_CLASS_ASSOCIATION_GRP_INFO;
+        return CommandClass.ASSOCIATION_GROUP_INFO;
     }
 
-    @ZWaveResponseHandler(id = ASSOCIATION_GROUP_INFO_NAME_REPORT, name = "ASSOCIATION_GROUP_INFO_NAME_REPORT")
-    public void handleAssociationGroupInfoNameReport(ZWaveCommandClassPayload payload, int endpoint) {
-        int groupIdx = payload.getPayloadByte(2);
-        int numBytes = payload.getPayloadByte(3);
+    /**
+     * {@inheritDoc}
+     *
+     * @throws ZWaveSerialMessageException
+     */
+    @Override
+    public void handleApplicationCommandRequest(SerialMessage serialMessage, int offset, int endpointId)
+            throws ZWaveSerialMessageException {
+        logger.debug("NODE {}: Received ASSOCIATION_GROUP_INFO command V{}", getNode().getNodeId(), getVersion());
+        int command = serialMessage.getMessagePayloadByte(offset);
+        switch (command) {
+            case ASSOCIATION_GROUP_INFO_NAME_REPORT:
+                logger.trace("NODE {}: Process Group Name Report", getNode().getNodeId());
+                processGroupNameReport(serialMessage, offset);
+                break;
+            case ASSOCIATION_GROUP_INFO_REPORT:
+                logger.trace("NODE {}: Process Group Info Report", getNode().getNodeId());
+                processInfoReport(serialMessage, offset);
+                break;
+            case ASSOCIATION_GROUP_INFO_LIST_REPORT:
+                logger.trace("NODE {}: Process Group Command List Report", getNode().getNodeId());
+                processCommandListReport(serialMessage, offset);
+                break;
+            default:
+                logger.warn("NODE {}: Unsupported Command {} for command class {} ({}).", getNode().getNodeId(),
+                        command, getCommandClass().getLabel(), getCommandClass().getKey());
+                break;
+        }
+    }
+
+    private void processGroupNameReport(SerialMessage serialMessage, int offset) throws ZWaveSerialMessageException {
+        int groupIdx = serialMessage.getMessagePayloadByte(offset + 1);
+        int numBytes = serialMessage.getMessagePayloadByte(offset + 2);
 
         if (numBytes < 0) {
-            logger.error("NODE {}: Group Name report error in message length ({})", getNode().getNodeId(),
-                    payload.getPayloadLength());
+            logger.debug("NODE {}: Group Name report error in message length ({})", getNode().getNodeId(),
+                    serialMessage.getMessagePayload().length);
         }
 
         if (numBytes == 0) {
@@ -124,13 +156,13 @@ public class ZWaveAssociationGroupInfoCommandClass extends ZWaveCommandClass
 
         // Check for non-printable characters - ignore anything after the first one!
         for (int c = 0; c < numBytes; c++) {
-            if (payload.getPayloadByte(c + 4) == 0) {
+            if (serialMessage.getMessagePayloadByte(c + offset + 3) == 0) {
                 numBytes = c;
                 logger.debug("NODE {}: Group name string truncated to {} characters", getNode().getNodeId(), numBytes);
                 break;
             }
         }
-        byte[] strBuffer = Arrays.copyOfRange(payload.getPayloadBuffer(), 4, 4 + numBytes);
+        byte[] strBuffer = Arrays.copyOfRange(serialMessage.getMessagePayload(), offset + 3, offset + 3 + numBytes);
         String groupName = null;
         try {
             groupName = new String(strBuffer, "UTF-8");
@@ -149,22 +181,21 @@ public class ZWaveAssociationGroupInfoCommandClass extends ZWaveCommandClass
         getNode().getAssociationGroup(groupIdx).setName(groupName);
     }
 
-    @ZWaveResponseHandler(id = ASSOCIATION_GROUP_INFO_REPORT, name = "ASSOCIATION_GROUP_INFO_REPORT")
-    public void handleAssociationGroupInfoReport(ZWaveCommandClassPayload payload, int endpoint) {
-        boolean listMode = (payload.getPayloadByte(2) & REPORT_LISTMODE_MASK) != 0;
-        boolean dynamicInfo = (payload.getPayloadByte(2) & REPORT_DYNAMICINFO_MASK) != 0;
+    private void processInfoReport(SerialMessage serialMessage, int offset) throws ZWaveSerialMessageException {
+        boolean listMode = (serialMessage.getMessagePayloadByte(offset + 1) & REPORT_LISTMODE_MASK) != 0;
+        boolean dynamicInfo = (serialMessage.getMessagePayloadByte(offset + 1) & REPORT_DYNAMICINFO_MASK) != 0;
 
         // Number of group info elements in this message. Not the total number of groups on the device.
         // The device can send multiple reports in list mode
-        int groupCount = payload.getPayloadByte(2) & REPORT_GROUPCOUNT_MASK;
+        int groupCount = serialMessage.getMessagePayloadByte(offset + 1) & REPORT_GROUPCOUNT_MASK;
         logger.debug("NODE {}: AssociationGroupInfoCmd_Info_Report: count:{} listMode:{} dynamicInfo:{}",
                 getNode().getNodeId(), groupCount, listMode, dynamicInfo);
 
         for (int i = 0; i < groupCount; i++) {
-            int groupIdx = payload.getPayloadByte(3 + i * 7);
-            int mode = payload.getPayloadByte(4 + i * 7);
-            int profile_msb = payload.getPayloadByte(5 + i * 7);
-            int profile_lsb = payload.getPayloadByte(6 + i * 7);
+            int groupIdx = serialMessage.getMessagePayloadByte(offset + 2 + i * 7);
+            int mode = serialMessage.getMessagePayloadByte(offset + 3 + i * 7);
+            int profile_msb = serialMessage.getMessagePayloadByte(offset + 4 + i * 7);
+            int profile_lsb = serialMessage.getMessagePayloadByte(offset + 5 + i * 7);
 
             logger.debug("NODE {}:    Group={}, Profile={} {}, mode:{}", getNode().getNodeId(), groupIdx,
                     String.format("%02X", profile_msb), String.format("%02X", profile_lsb), mode);
@@ -174,8 +205,8 @@ public class ZWaveAssociationGroupInfoCommandClass extends ZWaveCommandClass
                 group = new ZWaveAssociationGroup(groupIdx);
                 getNode().setAssociationGroup(group);
             }
-            group.setProfile1(profile_msb);
-            group.setProfile2(profile_lsb);
+            getNode().getAssociationGroup(groupIdx).setProfile1(profile_msb);
+            getNode().getAssociationGroup(groupIdx).setProfile2(profile_lsb);
 
             if ((profile_msb == PROFILE_GENERAL) && (profile_lsb == PROFILE_LIFELINE)) {
                 autoSubscribeGroups.add(groupIdx);
@@ -183,36 +214,33 @@ public class ZWaveAssociationGroupInfoCommandClass extends ZWaveCommandClass
         }
     }
 
-    @ZWaveResponseHandler(id = ASSOCIATION_GROUP_INFO_LIST_REPORT, name = "ASSOCIATION_GROUP_INFO_LIST_REPORT")
-    public void handleAssociationGroupInfoListReport(ZWaveCommandClassPayload payload, int endpoint) {
+    private void processCommandListReport(SerialMessage serialMessage, int offset) throws ZWaveSerialMessageException {
         // List the CommandClasses and commands that will be send to the associated nodes in this group.
         // For now just log it, later this could be used auto associate to the group
         // ie always associate when we find a battery command class
-        int groupId = payload.getPayloadByte(2);
-        int size = payload.getPayloadByte(3);
-        logger.debug("NODE {}: Supported Command classes and commands for group:{} ->", getNode().getNodeId(), groupId);
+        int groupid = serialMessage.getMessagePayloadByte(offset + 1);
+        int size = serialMessage.getMessagePayloadByte(offset + 2);
+        logger.debug("NODE {}: Supported Command classes and commands for group:{} ->", getNode().getNodeId(), groupid);
         Set<CommandClass> commands = new HashSet<>();
         for (int i = 0; i < size; i += 2) {
             // Check if this node actually supports this Command Class
             ZWaveCommandClass cc = getNode()
-                    .getCommandClass(CommandClass.getCommandClass(payload.getPayloadByte(4 + i)));
+                    .getCommandClass(CommandClass.getCommandClass(serialMessage.getMessagePayloadByte(offset + 3 + i)));
 
             if (cc != null) {
                 logger.debug("NODE {}:   {} command:{}", getNode().getNodeId(), cc.getCommandClass(),
-                        payload.getPayloadByte(i + 5));
+                        serialMessage.getMessagePayloadByte(offset + i + 4));
                 commands.add(cc.getCommandClass());
                 if (autoCCs.contains(cc.getCommandClass())) {
-                    autoSubscribeGroups.add(groupId);
+                    autoSubscribeGroups.add(groupid);
                 }
             } else {
                 logger.debug("NODE {}:   unsupported {} command:{}", getNode().getNodeId(),
-                        payload.getPayloadByte(4 + i), payload.getPayloadByte(5 + i));
+                        serialMessage.getMessagePayloadByte(offset + 3 + i),
+                        serialMessage.getMessagePayloadByte(offset + 4 + i));
             }
         }
-        if (getNode().getAssociationGroup(groupId) == null) {
-            getNode().setAssociationGroup(new ZWaveAssociationGroup(groupId));
-        }
-        getNode().getAssociationGroup(groupId).setCommandClasses(commands);
+        getNode().getAssociationGroup(groupid).setCommandClasses(commands);
     }
 
     /**
@@ -220,14 +248,21 @@ public class ZWaveAssociationGroupInfoCommandClass extends ZWaveCommandClass
      *
      * @return the serial message
      */
-    public ZWaveCommandClassTransactionPayload getGroupNameMessage(int groupidx) {
+    public SerialMessage getGroupNameMessage(int groupidx) {
         logger.debug("NODE {}: Creating new message for application command GROUP_NAME_GET for group {}",
                 getNode().getNodeId(), groupidx);
+        SerialMessage result = new SerialMessage(getNode().getNodeId(), SerialMessageClass.SendData,
+                SerialMessageType.Request, SerialMessageClass.ApplicationCommandHandler, SerialMessagePriority.Get);
 
-        return new ZWaveCommandClassTransactionPayloadBuilder(getNode().getNodeId(), getCommandClass(),
-                ASSOCIATION_GROUP_INFO_NAME_GET).withPayload(groupidx)
-                        .withExpectedResponseCommand(ASSOCIATION_GROUP_INFO_NAME_REPORT)
-                        .withPriority(TransactionPriority.Config).build();
+        ByteArrayOutputStream outputData = new ByteArrayOutputStream();
+        outputData.write(getNode().getNodeId());
+        outputData.write(3);
+        outputData.write(getCommandClass().getKey());
+        outputData.write(ASSOCIATION_GROUP_INFO_NAME_GET);
+        outputData.write(groupidx);
+        result.setMessagePayload(outputData.toByteArray());
+
+        return result;
     }
 
     /**
@@ -235,9 +270,11 @@ public class ZWaveAssociationGroupInfoCommandClass extends ZWaveCommandClass
      *
      * @return the serial message
      */
-    public ZWaveCommandClassTransactionPayload getInfoMessage(int groupidx) {
+    public SerialMessage getInfoMessage(int groupidx) {
         logger.debug("NODE {}: Creating new message for application command INFO_GET for group {}",
                 getNode().getNodeId(), groupidx);
+        SerialMessage result = new SerialMessage(getNode().getNodeId(), SerialMessageClass.SendData,
+                SerialMessageType.Request, SerialMessageClass.ApplicationCommandHandler, SerialMessagePriority.Get);
 
         byte listMode = 0;
         if (groupidx == 0) {
@@ -245,10 +282,17 @@ public class ZWaveAssociationGroupInfoCommandClass extends ZWaveCommandClass
             listMode = GET_LISTMODE_MASK;
         }
 
-        return new ZWaveCommandClassTransactionPayloadBuilder(getNode().getNodeId(), getCommandClass(),
-                ASSOCIATION_GROUP_INFO_GET).withPayload(listMode, groupidx)
-                        .withExpectedResponseCommand(ASSOCIATION_GROUP_INFO_REPORT)
-                        .withPriority(TransactionPriority.Config).build();
+        ByteArrayOutputStream outputData = new ByteArrayOutputStream();
+        outputData.write(getNode().getNodeId());
+        outputData.write(4);
+        outputData.write(getCommandClass().getKey());
+        outputData.write(ASSOCIATION_GROUP_INFO_GET);
+        outputData.write(listMode);
+        outputData.write(groupidx);
+
+        result.setMessagePayload(outputData.toByteArray());
+
+        return result;
     }
 
     /**
@@ -256,16 +300,25 @@ public class ZWaveAssociationGroupInfoCommandClass extends ZWaveCommandClass
      *
      * @return the serial message
      */
-    public ZWaveCommandClassTransactionPayload getCommandListMessage(int groupidx) {
+    public SerialMessage getCommandListMessage(int groupidx) {
         logger.debug("NODE {}: Creating new message for application command COMMAND_LIST_GET for group {}",
                 getNode().getNodeId(), groupidx);
+        SerialMessage result = new SerialMessage(getNode().getNodeId(), SerialMessageClass.SendData,
+                SerialMessageType.Request, SerialMessageClass.ApplicationCommandHandler, SerialMessagePriority.Get);
 
         byte allowCache = 0;
 
-        return new ZWaveCommandClassTransactionPayloadBuilder(getNode().getNodeId(), getCommandClass(),
-                ASSOCIATION_GROUP_INFO_LIST_GET).withPayload(allowCache, groupidx)
-                        .withExpectedResponseCommand(ASSOCIATION_GROUP_INFO_LIST_REPORT)
-                        .withPriority(TransactionPriority.Config).build();
+        ByteArrayOutputStream outputData = new ByteArrayOutputStream();
+        outputData.write(getNode().getNodeId());
+        outputData.write(4);
+        outputData.write(getCommandClass().getKey());
+        outputData.write(ASSOCIATION_GROUP_INFO_LIST_GET);
+        outputData.write(allowCache);
+        outputData.write(groupidx);
+
+        result.setMessagePayload(outputData.toByteArray());
+
+        return result;
     }
 
     /**
@@ -278,8 +331,8 @@ public class ZWaveAssociationGroupInfoCommandClass extends ZWaveCommandClass
     }
 
     @Override
-    public Collection<ZWaveCommandClassTransactionPayload> initialize(boolean refresh) {
-        ArrayList<ZWaveCommandClassTransactionPayload> result = new ArrayList<ZWaveCommandClassTransactionPayload>();
+    public Collection<SerialMessage> initialize(boolean refresh) {
+        ArrayList<SerialMessage> result = new ArrayList<SerialMessage>();
 
         // Only initialise the root endpoint
         if (getEndpoint() != null) {
@@ -302,7 +355,7 @@ public class ZWaveAssociationGroupInfoCommandClass extends ZWaveCommandClass
             if (refresh == true || group.getName() == null) {
                 result.add(getGroupNameMessage(group.getIndex()));
             }
-            if (refresh == true || group.isProfileKnown() == false) {
+            if (refresh == true || group.getProfile1() == null) {
                 result.add(getInfoMessage(group.getIndex()));
             }
             if (refresh == true || group.getCommandClasses() == null) {
@@ -312,4 +365,5 @@ public class ZWaveAssociationGroupInfoCommandClass extends ZWaveCommandClass
 
         return result;
     }
+
 }

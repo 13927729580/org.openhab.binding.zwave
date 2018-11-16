@@ -1,5 +1,6 @@
 /**
- * Copyright (c) 2010-2018 by the respective copyright holders.
+ * Copyright (c) 2014-2016 by the respective copyright holders.
+ *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v1.0
  * which accompanies this distribution, and is available at
@@ -14,13 +15,13 @@ import org.eclipse.smarthome.core.library.types.OnOffType;
 import org.eclipse.smarthome.core.types.State;
 import org.openhab.binding.zwave.handler.ZWaveControllerHandler;
 import org.openhab.binding.zwave.handler.ZWaveThingChannel;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage;
 import org.openhab.binding.zwave.internal.protocol.ZWaveNode;
 import org.openhab.binding.zwave.internal.protocol.commandclass.ZWaveAlarmSensorCommandClass;
 import org.openhab.binding.zwave.internal.protocol.commandclass.ZWaveAlarmSensorCommandClass.AlarmType;
 import org.openhab.binding.zwave.internal.protocol.commandclass.ZWaveAlarmSensorCommandClass.ZWaveAlarmSensorValueEvent;
 import org.openhab.binding.zwave.internal.protocol.commandclass.ZWaveCommandClass;
 import org.openhab.binding.zwave.internal.protocol.event.ZWaveCommandClassValueEvent;
-import org.openhab.binding.zwave.internal.protocol.transaction.ZWaveCommandClassTransactionPayload;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -33,7 +34,7 @@ import org.slf4j.LoggerFactory;
  */
 public class ZWaveAlarmSensorConverter extends ZWaveCommandClassConverter {
 
-    private final Logger logger = LoggerFactory.getLogger(ZWaveAlarmSensorConverter.class);
+    private final static Logger logger = LoggerFactory.getLogger(ZWaveAlarmSensorConverter.class);
 
     /**
      * Constructor. Creates a new instance of the {@link ZWaveAlarmSensorConverter} class.
@@ -43,36 +44,41 @@ public class ZWaveAlarmSensorConverter extends ZWaveCommandClassConverter {
         super(controller);
     }
 
+    /**
+     * {@inheritDoc}
+     */
     @Override
-    public List<ZWaveCommandClassTransactionPayload> executeRefresh(ZWaveThingChannel channel, ZWaveNode node) {
+    public List<SerialMessage> executeRefresh(ZWaveThingChannel channel, ZWaveNode node) {
         ZWaveAlarmSensorCommandClass commandClass = (ZWaveAlarmSensorCommandClass) node
-                .resolveCommandClass(ZWaveCommandClass.CommandClass.COMMAND_CLASS_SENSOR_ALARM, channel.getEndpoint());
+                .resolveCommandClass(ZWaveCommandClass.CommandClass.SENSOR_ALARM, channel.getEndpoint());
         if (commandClass == null) {
             return null;
         }
 
         String alarmType = channel.getArguments().get("alarmType");
         logger.debug("NODE {}: Generating poll message for {}, endpoint {}, alarm {}", node.getNodeId(),
-                commandClass.getCommandClass(), channel.getEndpoint(), alarmType);
+                commandClass.getCommandClass().getLabel(), channel.getEndpoint(), alarmType);
 
-        ZWaveCommandClassTransactionPayload transaction;
+        SerialMessage serialMessage;
         if (alarmType != null) {
-            transaction = commandClass.getMessage(AlarmType.valueOf(alarmType));
+            serialMessage = node.encapsulate(commandClass.getMessage(AlarmType.valueOf(alarmType)), commandClass,
+                    channel.getEndpoint());
         } else {
-            transaction = commandClass.getValueMessage();
+            serialMessage = node.encapsulate(commandClass.getValueMessage(), commandClass, channel.getEndpoint());
         }
 
-        if (transaction == null) {
+        if (serialMessage == null) {
             return null;
         }
 
-        node.encapsulate(transaction, channel.getEndpoint());
-
-        List<ZWaveCommandClassTransactionPayload> response = new ArrayList<ZWaveCommandClassTransactionPayload>();
-        response.add(transaction);
+        List<SerialMessage> response = new ArrayList<SerialMessage>();
+        response.add(serialMessage);
         return response;
     }
 
+    /**
+     * {@inheritDoc}
+     */
     @Override
     public State handleEvent(ZWaveThingChannel channel, ZWaveCommandClassValueEvent event) {
         String alarmType = channel.getArguments().get("type");

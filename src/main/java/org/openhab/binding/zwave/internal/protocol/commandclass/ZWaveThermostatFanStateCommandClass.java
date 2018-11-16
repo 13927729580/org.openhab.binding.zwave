@@ -1,5 +1,6 @@
 /**
- * Copyright (c) 2010-2018 by the respective copyright holders.
+ * Copyright (c) 2014-2016 by the respective copyright holders.
+ *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v1.0
  * which accompanies this distribution, and is available at
@@ -14,15 +15,15 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 
-import org.openhab.binding.zwave.internal.protocol.ZWaveCommandClassPayload;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage.SerialMessageClass;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage.SerialMessagePriority;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage.SerialMessageType;
 import org.openhab.binding.zwave.internal.protocol.ZWaveController;
 import org.openhab.binding.zwave.internal.protocol.ZWaveEndpoint;
 import org.openhab.binding.zwave.internal.protocol.ZWaveNode;
 import org.openhab.binding.zwave.internal.protocol.ZWaveSerialMessageException;
-import org.openhab.binding.zwave.internal.protocol.ZWaveTransaction.TransactionPriority;
 import org.openhab.binding.zwave.internal.protocol.event.ZWaveCommandClassValueEvent;
-import org.openhab.binding.zwave.internal.protocol.transaction.ZWaveCommandClassTransactionPayload;
-import org.openhab.binding.zwave.internal.protocol.transaction.ZWaveCommandClassTransactionPayloadBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -35,11 +36,12 @@ import com.thoughtworks.xstream.annotations.XStreamOmitField;
  * @author Chris Jackson
  * @author Dan Cunningham
  */
-@XStreamAlias("COMMAND_CLASS_THERMOSTAT_FAN_STATE")
-public class ZWaveThermostatFanStateCommandClass extends ZWaveCommandClass implements ZWaveCommandClassDynamicState {
+@XStreamAlias("thermostatFanStateCommandClass")
+public class ZWaveThermostatFanStateCommandClass extends ZWaveCommandClass
+        implements ZWaveGetCommands, ZWaveCommandClassDynamicState {
 
     @XStreamOmitField
-    private static final Logger logger = LoggerFactory.getLogger(ZWaveThermostatFanStateCommandClass.class);
+    private final static Logger logger = LoggerFactory.getLogger(ZWaveThermostatFanStateCommandClass.class);
 
     private static final byte THERMOSTAT_FAN_STATE_GET = 0x2;
     private static final byte THERMOSTAT_FAN_STATE_REPORT = 0x3;
@@ -62,14 +64,41 @@ public class ZWaveThermostatFanStateCommandClass extends ZWaveCommandClass imple
         super(node, controller, endpoint);
     }
 
+    /**
+     * {@inheritDoc}
+     */
     @Override
     public CommandClass getCommandClass() {
-        return CommandClass.COMMAND_CLASS_THERMOSTAT_FAN_STATE;
+        return CommandClass.THERMOSTAT_FAN_STATE;
     }
 
+    /**
+     * {@inheritDoc}
+     */
     @Override
     public int getMaxVersion() {
         return 2;
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @throws ZWaveSerialMessageException
+     */
+    @Override
+    public void handleApplicationCommandRequest(SerialMessage serialMessage, int offset, int endpoint)
+            throws ZWaveSerialMessageException {
+        logger.debug("NODE {}: Received Thermostat Fan State Request", this.getNode().getNodeId());
+        int command = serialMessage.getMessagePayloadByte(offset);
+        switch (command) {
+            case THERMOSTAT_FAN_STATE_REPORT:
+                logger.trace("NODE {}: Process Thermostat Fan State Report", this.getNode().getNodeId());
+                processThermostatFanStateReport(serialMessage, offset, endpoint);
+                break;
+            default:
+                logger.warn("NODE {}: Unsupported Command {} for command class {} ({}).", this.getNode().getNodeId(),
+                        command, this.getCommandClass().getLabel(), this.getCommandClass().getKey());
+        }
     }
 
     /**
@@ -80,16 +109,17 @@ public class ZWaveThermostatFanStateCommandClass extends ZWaveCommandClass imple
      * @param endpoint the endpoint or instance number this message is meant for.
      * @throws ZWaveSerialMessageException
      */
-    @ZWaveResponseHandler(id = THERMOSTAT_FAN_STATE_REPORT, name = "THERMOSTAT_FAN_STATE_REPORT")
-    public void handleThermostatFanStateReport(ZWaveCommandClassPayload payload, int endpoint) {
-        int value = payload.getPayloadByte(2);
+    protected void processThermostatFanStateReport(SerialMessage serialMessage, int offset, int endpoint)
+            throws ZWaveSerialMessageException {
+
+        int value = serialMessage.getMessagePayloadByte(offset + 1);
 
         logger.debug("NODE {}: Thermostat fan state report value = {}", this.getNode().getNodeId(), value);
 
         FanStateType fanStateType = FanStateType.getFanStateType(value);
 
         if (fanStateType == null) {
-            logger.error("NODE {}: Unknown fan state Type = {}, ignoring report.", this.getNode().getNodeId(), value);
+            logger.debug("NODE {}: Unknown fan state Type = {}, ignoring report.", this.getNode().getNodeId(), value);
             return;
         }
 
@@ -107,28 +137,37 @@ public class ZWaveThermostatFanStateCommandClass extends ZWaveCommandClass imple
         this.getController().notifyEventListeners(zEvent);
     }
 
+    /**
+     * {@inheritDoc}
+     */
     @Override
-    public Collection<ZWaveCommandClassTransactionPayload> getDynamicValues(boolean refresh) {
+    public Collection<SerialMessage> getDynamicValues(boolean refresh) {
         // TODO (or question for Dan from Chris) - shouldn't this iterate through all fan modes?
-        ArrayList<ZWaveCommandClassTransactionPayload> result = new ArrayList<ZWaveCommandClassTransactionPayload>();
+        ArrayList<SerialMessage> result = new ArrayList<SerialMessage>();
         if (refresh == true || dynamicDone == false) {
             result.add(getValueMessage());
         }
         return result;
     }
 
-    public ZWaveCommandClassTransactionPayload getValueMessage() {
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public SerialMessage getValueMessage() {
         if (isGetSupported == false) {
             logger.debug("NODE {}: Node doesn't support get requests", this.getNode().getNodeId());
             return null;
         }
 
         logger.debug("NODE {}: Creating new message for application command THERMOSTAT_FAN_STATE_GET",
-                getNode().getNodeId());
-
-        return new ZWaveCommandClassTransactionPayloadBuilder(getNode().getNodeId(), getCommandClass(),
-                THERMOSTAT_FAN_STATE_GET).withPriority(TransactionPriority.Get)
-                        .withExpectedResponseCommand(THERMOSTAT_FAN_STATE_REPORT).build();
+                this.getNode().getNodeId());
+        SerialMessage result = new SerialMessage(this.getNode().getNodeId(), SerialMessageClass.SendData,
+                SerialMessageType.Request, SerialMessageClass.ApplicationCommandHandler, SerialMessagePriority.Get);
+        byte[] payload = { (byte) this.getNode().getNodeId(), 2, (byte) getCommandClass().getKey(),
+                THERMOSTAT_FAN_STATE_GET };
+        result.setMessagePayload(payload);
+        return result;
     }
 
     @Override

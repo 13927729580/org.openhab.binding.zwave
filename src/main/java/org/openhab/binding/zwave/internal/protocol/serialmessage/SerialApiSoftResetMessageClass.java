@@ -1,5 +1,6 @@
 /**
- * Copyright (c) 2010-2018 by the respective copyright holders.
+ * Copyright (c) 2014-2016 by the respective copyright holders.
+ *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v1.0
  * which accompanies this distribution, and is available at
@@ -9,10 +10,9 @@ package org.openhab.binding.zwave.internal.protocol.serialmessage;
 
 import org.openhab.binding.zwave.internal.protocol.SerialMessage;
 import org.openhab.binding.zwave.internal.protocol.SerialMessage.SerialMessageClass;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage.SerialMessagePriority;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage.SerialMessageType;
 import org.openhab.binding.zwave.internal.protocol.ZWaveController;
-import org.openhab.binding.zwave.internal.protocol.ZWaveSerialPayload;
-import org.openhab.binding.zwave.internal.protocol.ZWaveTransaction;
-import org.openhab.binding.zwave.internal.protocol.transaction.ZWaveTransactionMessageBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -22,20 +22,20 @@ import org.slf4j.LoggerFactory;
  * @author Chris Jackson
  */
 public class SerialApiSoftResetMessageClass extends ZWaveCommandProcessor {
-    private final Logger logger = LoggerFactory.getLogger(SerialApiSoftResetMessageClass.class);
+    private final static Logger logger = LoggerFactory.getLogger(SerialApiSoftResetMessageClass.class);
 
-    public ZWaveSerialPayload doRequest() {
-
-        // Create the request
-        return new ZWaveTransactionMessageBuilder(SerialMessageClass.SerialApiSoftReset).build();
+    public SerialMessage doRequest() {
+        return new SerialMessage(SerialMessageClass.SerialApiSoftReset, SerialMessageType.Request,
+                SerialMessageClass.SerialApiSoftReset, SerialMessagePriority.High);
     }
 
     @Override
-    public boolean handleResponse(ZWaveController zController, ZWaveTransaction transaction,
+    public boolean handleResponse(ZWaveController zController, SerialMessage lastSentMessage,
             SerialMessage incomingMessage) {
-        logger.debug("Received soft reset response");
+        logger.debug(String.format("Received soft reset response"));
 
-        transaction.setTransactionComplete();
+        checkTransactionComplete(lastSentMessage, incomingMessage);
+
         return true;
     }
 }

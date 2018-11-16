@@ -1,5 +1,6 @@
 /**
- * Copyright (c) 2010-2018 by the respective copyright holders.
+ * Copyright (c) 2014-2016 by the respective copyright holders.
+ *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v1.0
  * which accompanies this distribution, and is available at
@@ -15,6 +16,7 @@ import org.eclipse.smarthome.core.types.Command;
 import org.eclipse.smarthome.core.types.State;
 import org.openhab.binding.zwave.handler.ZWaveControllerHandler;
 import org.openhab.binding.zwave.handler.ZWaveThingChannel;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage;
 import org.openhab.binding.zwave.internal.protocol.ZWaveNode;
 import org.openhab.binding.zwave.internal.protocol.commandclass.ZWaveCommandClass;
 import org.openhab.binding.zwave.internal.protocol.commandclass.ZWaveProtectionCommandClass;
@@ -22,7 +24,6 @@ import org.openhab.binding.zwave.internal.protocol.commandclass.ZWaveProtectionC
 import org.openhab.binding.zwave.internal.protocol.commandclass.ZWaveProtectionCommandClass.RfProtectionType;
 import org.openhab.binding.zwave.internal.protocol.commandclass.ZWaveProtectionCommandClass.Type;
 import org.openhab.binding.zwave.internal.protocol.event.ZWaveCommandClassValueEvent;
-import org.openhab.binding.zwave.internal.protocol.transaction.ZWaveCommandClassTransactionPayload;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -33,7 +34,7 @@ import org.slf4j.LoggerFactory;
  */
 public class ZWaveProtectionConverter extends ZWaveCommandClassConverter {
 
-    private final Logger logger = LoggerFactory.getLogger(ZWaveProtectionConverter.class);
+    private final static Logger logger = LoggerFactory.getLogger(ZWaveProtectionConverter.class);
 
     /**
      * Constructor. Creates a new instance of the {@link ZWaveConverterBase} class.
@@ -57,18 +58,17 @@ public class ZWaveProtectionConverter extends ZWaveCommandClassConverter {
     }
 
     @Override
-    public List<ZWaveCommandClassTransactionPayload> receiveCommand(ZWaveThingChannel channel, ZWaveNode node,
-            Command command) {
+    public List<SerialMessage> receiveCommand(ZWaveThingChannel channel, ZWaveNode node, Command command) {
         String type = channel.getArguments().get("type");
 
         ZWaveProtectionCommandClass commandClass = (ZWaveProtectionCommandClass) node
-                .resolveCommandClass(ZWaveCommandClass.CommandClass.COMMAND_CLASS_PROTECTION, channel.getEndpoint());
+                .resolveCommandClass(ZWaveCommandClass.CommandClass.PROTECTION, channel.getEndpoint());
 
         if (commandClass == null) {
             return null;
         }
 
-        ZWaveCommandClassTransactionPayload serialMessage = null;
+        SerialMessage serialMessage = null;
 
         if (type != null) {
             if (Type.PROTECTION_LOCAL.name().equals(type)) {
@@ -77,7 +77,7 @@ public class ZWaveProtectionConverter extends ZWaveCommandClassConverter {
                 int value = ((DecimalType) command).intValue();
                 if (value >= 0 && value < LocalProtectionType.values().length) {
                     serialMessage = node.encapsulate(
-                            commandClass.setValueMessage(LocalProtectionType.values()[value], null),
+                            commandClass.setValueMessage(LocalProtectionType.values()[value], null), commandClass,
                             channel.getEndpoint());
                 }
 
@@ -88,7 +88,7 @@ public class ZWaveProtectionConverter extends ZWaveCommandClassConverter {
                 int value = ((DecimalType) command).intValue();
                 if (value >= 0 && value < RfProtectionType.values().length) {
                     serialMessage = node.encapsulate(
-                            commandClass.setValueMessage(null, RfProtectionType.values()[value]),
+                            commandClass.setValueMessage(null, RfProtectionType.values()[value]), commandClass,
                             channel.getEndpoint());
                 }
             }
@@ -96,16 +96,16 @@ public class ZWaveProtectionConverter extends ZWaveCommandClassConverter {
 
         if (serialMessage == null) {
             logger.warn("NODE {}: Generating message failed for command class = {}, endpoint = {}", node.getNodeId(),
-                    commandClass.getCommandClass(), channel.getEndpoint());
+                    commandClass.getCommandClass().getLabel(), channel.getEndpoint());
             return null;
         }
 
         logger.debug("NODE {}: Sending Message: {}", node.getNodeId(), serialMessage);
-        List<ZWaveCommandClassTransactionPayload> messages = new ArrayList<ZWaveCommandClassTransactionPayload>();
+        List<SerialMessage> messages = new ArrayList<SerialMessage>();
         messages.add(serialMessage);
 
         // Request an update so that OH knows when the protection settings has changed.
-        serialMessage = node.encapsulate(commandClass.getValueMessage(), channel.getEndpoint());
+        serialMessage = node.encapsulate(commandClass.getValueMessage(), commandClass, channel.getEndpoint());
 
         if (serialMessage != null) {
             messages.add(serialMessage);

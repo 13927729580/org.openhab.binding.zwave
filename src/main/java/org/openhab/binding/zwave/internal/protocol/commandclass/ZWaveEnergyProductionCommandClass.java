@@ -1,5 +1,6 @@
 /**
- * Copyright (c) 2010-2018 by the respective copyright holders.
+ * Copyright (c) 2014-2016 by the respective copyright holders.
+ *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v1.0
  * which accompanies this distribution, and is available at
@@ -7,9 +8,11 @@
  */
 package org.openhab.binding.zwave.internal.protocol.commandclass;
 
+import org.openhab.binding.zwave.internal.protocol.SerialMessage;
 import org.openhab.binding.zwave.internal.protocol.ZWaveController;
 import org.openhab.binding.zwave.internal.protocol.ZWaveEndpoint;
 import org.openhab.binding.zwave.internal.protocol.ZWaveNode;
+import org.openhab.binding.zwave.internal.protocol.ZWaveSerialMessageException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -22,11 +25,11 @@ import com.thoughtworks.xstream.annotations.XStreamOmitField;
  * @author Chris Jackson
  *
  */
-@XStreamAlias("COMMAND_CLASS_ENERGY_PRODUCTION")
+@XStreamAlias("energyProductionCommandClass")
 public class ZWaveEnergyProductionCommandClass extends ZWaveCommandClass {
 
     @XStreamOmitField
-    private static final Logger logger = LoggerFactory.getLogger(ZWaveEnergyProductionCommandClass.class);
+    private final static Logger logger = LoggerFactory.getLogger(ZWaveEnergyProductionCommandClass.class);
 
     /**
      * Creates a new instance of the ZWaveEnergyProductionCommandClass class.
@@ -39,8 +42,29 @@ public class ZWaveEnergyProductionCommandClass extends ZWaveCommandClass {
         super(node, controller, endpoint);
     }
 
+    /**
+     * {@inheritDoc}
+     */
     @Override
     public CommandClass getCommandClass() {
-        return CommandClass.COMMAND_CLASS_ENERGY_PRODUCTION;
+        return CommandClass.ENERGY_PRODUCTION;
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @throws ZWaveSerialMessageException
+     */
+    @Override
+    public void handleApplicationCommandRequest(SerialMessage serialMessage, int offset, int endpoint)
+            throws ZWaveSerialMessageException {
+        logger.debug("NODE {}: Received ENERGY_PRODUCTION command V{}", getNode().getNodeId(), getVersion());
+        int command = serialMessage.getMessagePayloadByte(offset);
+        switch (command) {
+            default:
+                logger.warn(String.format("NODE %d: Unsupported Command %d for command class %s (0x%02X).",
+                        getNode().getNodeId(), command, getCommandClass().getLabel(), getCommandClass().getKey()));
+                break;
+        }
     }
 }

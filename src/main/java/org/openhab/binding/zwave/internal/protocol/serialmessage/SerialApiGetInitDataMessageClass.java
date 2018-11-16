@@ -1,5 +1,6 @@
 /**
- * Copyright (c) 2010-2018 by the respective copyright holders.
+ * Copyright (c) 2014-2016 by the respective copyright holders.
+ *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v1.0
  * which accompanies this distribution, and is available at
@@ -11,11 +12,10 @@ import java.util.ArrayList;
 
 import org.openhab.binding.zwave.internal.protocol.SerialMessage;
 import org.openhab.binding.zwave.internal.protocol.SerialMessage.SerialMessageClass;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage.SerialMessagePriority;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage.SerialMessageType;
 import org.openhab.binding.zwave.internal.protocol.ZWaveController;
 import org.openhab.binding.zwave.internal.protocol.ZWaveSerialMessageException;
-import org.openhab.binding.zwave.internal.protocol.ZWaveSerialPayload;
-import org.openhab.binding.zwave.internal.protocol.ZWaveTransaction;
-import org.openhab.binding.zwave.internal.protocol.transaction.ZWaveTransactionMessageBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -25,25 +25,25 @@ import org.slf4j.LoggerFactory;
  * @author Chris Jackson
  */
 public class SerialApiGetInitDataMessageClass extends ZWaveCommandProcessor {
-    private final Logger logger = LoggerFactory.getLogger(SerialApiGetInitDataMessageClass.class);
+    private final static Logger logger = LoggerFactory.getLogger(SerialApiGetInitDataMessageClass.class);
 
     private final ArrayList<Integer> zwaveNodes = new ArrayList<Integer>();
 
     private static final int NODE_BYTES = 29; // 29 bytes = 232 bits, one for each supported node by Z-Wave;
 
-    public ZWaveSerialPayload doRequest() {
-        // Create the request
-        return new ZWaveTransactionMessageBuilder(SerialMessageClass.SerialApiGetInitData).build();
+    public SerialMessage doRequest() {
+        return new SerialMessage(SerialMessageClass.SerialApiGetInitData, SerialMessageType.Request,
+                SerialMessageClass.SerialApiGetInitData, SerialMessagePriority.High);
     }
 
     @Override
-    public boolean handleResponse(ZWaveController zController, ZWaveTransaction transaction,
+    public boolean handleResponse(ZWaveController zController, SerialMessage lastSentMessage,
             SerialMessage incomingMessage) throws ZWaveSerialMessageException {
         logger.debug("Got MessageSerialApiGetInitData response.");
         int nodeBytes = incomingMessage.getMessagePayloadByte(2);
 
         if (nodeBytes != NODE_BYTES) {
-            logger.error("Invalid number of node bytes = {}", nodeBytes);
+            logger.debug("Invalid number of node bytes = {}", nodeBytes);
             return false;
         }
 
@@ -57,7 +57,7 @@ public class SerialApiGetInitDataMessageClass extends ZWaveCommandProcessor {
                 int b1 = incomingByte & (int) Math.pow(2.0D, j);
                 int b2 = (int) Math.pow(2.0D, j);
                 if (b1 == b2) {
-                    logger.debug("NODE {}: Node found", nodeId);
+                    logger.info("NODE {}: Node found", nodeId);
 
                     zwaveNodes.add(nodeId);
                 }
@@ -65,15 +65,16 @@ public class SerialApiGetInitDataMessageClass extends ZWaveCommandProcessor {
             }
         }
 
-        logger.debug("ZWave Controller using {} API",
+        logger.info("ZWave Controller using {} API",
                 ((incomingMessage.getMessagePayloadByte(1) & 0x01) == 1) ? "Slave" : "Controller");
-        logger.debug("ZWave Controller is {} Controller",
+        logger.info("ZWave Controller is {} Controller",
                 ((incomingMessage.getMessagePayloadByte(1) & 0x04) == 1) ? "Secondary" : "Primary");
-        logger.debug("------------Number of Nodes Found Registered to ZWave Controller------------");
-        logger.debug("# Nodes = {}", zwaveNodes.size());
-        logger.debug("----------------------------------------------------------------------------");
+        logger.info("------------Number of Nodes Found Registered to ZWave Controller------------");
+        logger.info(String.format("# Nodes = %d", zwaveNodes.size()));
+        logger.info("----------------------------------------------------------------------------");
 
-        transaction.setTransactionComplete();
+        checkTransactionComplete(lastSentMessage, incomingMessage);
+
         return true;
     }
 

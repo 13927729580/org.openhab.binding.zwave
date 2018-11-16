@@ -1,5 +1,6 @@
 /**
- * Copyright (c) 2010-2018 by the respective copyright holders.
+ * Copyright (c) 2014-2016 by the respective copyright holders.
+ *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v1.0
  * which accompanies this distribution, and is available at
@@ -9,7 +10,7 @@ package org.openhab.binding.zwave.internal.protocol.commandclass;
 
 import java.util.Collection;
 
-import org.openhab.binding.zwave.internal.protocol.transaction.ZWaveCommandClassTransactionPayload;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage;
 
 /**
  * Interface that command classes can implement to implement initialization.
@@ -27,5 +28,5 @@ public interface ZWaveCommandClassInitialization {
      * @param refresh if true will request all initialised even if the class is already initialised
      * @return the messages with the queries for initialization.
      */
-    public Collection<ZWaveCommandClassTransactionPayload> initialize(boolean refresh);
+    public Collection<SerialMessage> initialize(boolean refresh);
 }

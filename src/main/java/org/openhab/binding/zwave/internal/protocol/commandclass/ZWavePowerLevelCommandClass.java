@@ -1,5 +1,6 @@
 /**
- * Copyright (c) 2010-2018 by the respective copyright holders.
+ * Copyright (c) 2014-2016 by the respective copyright holders.
+ *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v1.0
  * which accompanies this distribution, and is available at
@@ -7,17 +8,19 @@
  */
 package org.openhab.binding.zwave.internal.protocol.commandclass;
 
+import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.Collection;
 
-import org.openhab.binding.zwave.internal.protocol.ZWaveCommandClassPayload;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage.SerialMessageClass;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage.SerialMessagePriority;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage.SerialMessageType;
 import org.openhab.binding.zwave.internal.protocol.ZWaveController;
 import org.openhab.binding.zwave.internal.protocol.ZWaveEndpoint;
 import org.openhab.binding.zwave.internal.protocol.ZWaveNode;
-import org.openhab.binding.zwave.internal.protocol.ZWaveTransaction.TransactionPriority;
+import org.openhab.binding.zwave.internal.protocol.ZWaveSerialMessageException;
 import org.openhab.binding.zwave.internal.protocol.event.ZWaveCommandClassValueEvent;
-import org.openhab.binding.zwave.internal.protocol.transaction.ZWaveCommandClassTransactionPayload;
-import org.openhab.binding.zwave.internal.protocol.transaction.ZWaveCommandClassTransactionPayloadBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -29,11 +32,12 @@ import com.thoughtworks.xstream.annotations.XStreamOmitField;
  *
  * @author Chris Jackson
  */
-@XStreamAlias("COMMAND_CLASS_POWERLEVEL")
-public class ZWavePowerLevelCommandClass extends ZWaveCommandClass implements ZWaveCommandClassDynamicState {
+@XStreamAlias("powerLevelCommandClass")
+public class ZWavePowerLevelCommandClass extends ZWaveCommandClass
+        implements ZWaveGetCommands, ZWaveCommandClassDynamicState {
 
     @XStreamOmitField
-    private static final Logger logger = LoggerFactory.getLogger(ZWavePowerLevelCommandClass.class);
+    private final static Logger logger = LoggerFactory.getLogger(ZWavePowerLevelCommandClass.class);
 
     private static final int POWERLEVEL_SET = 1;
     private static final int POWERLEVEL_GET = 2;
@@ -59,24 +63,43 @@ public class ZWavePowerLevelCommandClass extends ZWaveCommandClass implements ZW
         super(node, controller, endpoint);
     }
 
+    /**
+     * {@inheritDoc}
+     */
     @Override
     public CommandClass getCommandClass() {
-        return CommandClass.COMMAND_CLASS_POWERLEVEL;
+        return CommandClass.POWERLEVEL;
     }
 
-    @ZWaveResponseHandler(id = POWERLEVEL_REPORT, name = "POWERLEVEL_REPORT")
-    public void handleZwavePlusReport(ZWaveCommandClassPayload payload, int endpoint) {
-        powerLevel = payload.getPayloadByte(2);
-        powerTimeout = payload.getPayloadByte(3);
-        logger.debug("NODE {}: Received POWERLEVEL report -{}dB with {} second timeout", getNode().getNodeId(),
-                powerLevel, powerTimeout);
-        ZWavePowerLevelCommandClassChangeEvent event = new ZWavePowerLevelCommandClassChangeEvent(getNode().getNodeId(),
-                powerLevel, powerTimeout);
-        getController().notifyEventListeners(event);
-        initialiseDone = true;
+    /**
+     * {@inheritDoc}
+     *
+     * @throws ZWaveSerialMessageException
+     */
+    @Override
+    public void handleApplicationCommandRequest(SerialMessage serialMessage, int offset, int endpoint)
+            throws ZWaveSerialMessageException {
+        logger.debug("NODE {}: Received POWERLEVEL command V{}", getNode().getNodeId(), getVersion());
+        int command = serialMessage.getMessagePayloadByte(offset);
+        switch (command) {
+            case POWERLEVEL_REPORT:
+                powerLevel = serialMessage.getMessagePayloadByte(offset + 1);
+                powerTimeout = serialMessage.getMessagePayloadByte(offset + 2);
+                logger.debug("NODE {}: Received POWERLEVEL report -{}dB with {} second timeout", getNode().getNodeId(),
+                        powerLevel, powerTimeout);
+                ZWavePowerLevelCommandClassChangeEvent event = new ZWavePowerLevelCommandClassChangeEvent(
+                        getNode().getNodeId(), powerLevel, powerTimeout);
+                getController().notifyEventListeners(event);
+                initialiseDone = true;
+                break;
+            default:
+                logger.warn(String.format("NODE %d: Unsupported Command %d for command class %s (0x%02X).",
+                        getNode().getNodeId(), command, getCommandClass().getLabel(), getCommandClass().getKey()));
+                break;
+        }
     }
 
-    public ZWaveCommandClassTransactionPayload setValueMessage(int level, int timeout) {
+    public SerialMessage setValueMessage(int level, int timeout) {
         logger.debug("NODE {}: Creating new message for application command POWERLEVEL_SET, level={}, timeout={}",
                 getNode().getNodeId(), level, timeout);
 
@@ -90,20 +113,37 @@ public class ZWavePowerLevelCommandClass extends ZWaveCommandClass implements ZW
             return null;
         }
 
-        return new ZWaveCommandClassTransactionPayloadBuilder(getNode().getNodeId(), getCommandClass(), POWERLEVEL_SET)
-                .withPayload(level, timeout).withPriority(TransactionPriority.Config).build();
-    }
-
-    public ZWaveCommandClassTransactionPayload getValueMessage() {
-        logger.debug("NODE {}: Creating new message for application command POWERLEVEL_GET", getNode().getNodeId());
-
-        return new ZWaveCommandClassTransactionPayloadBuilder(getNode().getNodeId(), getCommandClass(), POWERLEVEL_GET)
-                .withPriority(TransactionPriority.Config).withExpectedResponseCommand(POWERLEVEL_REPORT).build();
+        SerialMessage message = new SerialMessage(getNode().getNodeId(), SerialMessageClass.SendData,
+                SerialMessageType.Request, SerialMessageClass.ApplicationCommandHandler, SerialMessagePriority.Set);
+        ByteArrayOutputStream outputData = new ByteArrayOutputStream();
+        outputData.write((byte) getNode().getNodeId());
+        outputData.write(4);
+        outputData.write((byte) getCommandClass().getKey());
+        outputData.write((byte) POWERLEVEL_SET);
+        outputData.write((byte) level);
+        outputData.write((byte) timeout);
+        message.setMessagePayload(outputData.toByteArray());
+        return message;
     }
 
     @Override
-    public Collection<ZWaveCommandClassTransactionPayload> getDynamicValues(boolean refresh) {
-        ArrayList<ZWaveCommandClassTransactionPayload> result = new ArrayList<ZWaveCommandClassTransactionPayload>();
+    public SerialMessage getValueMessage() {
+        logger.debug("NODE {}: Creating new message for application command POWERLEVEL_GET", getNode().getNodeId());
+        SerialMessage message = new SerialMessage(getNode().getNodeId(), SerialMessageClass.SendData,
+                SerialMessageType.Request, SerialMessageClass.ApplicationCommandHandler, SerialMessagePriority.Get);
+
+        ByteArrayOutputStream outputData = new ByteArrayOutputStream();
+        outputData.write((byte) getNode().getNodeId());
+        outputData.write(2);
+        outputData.write((byte) getCommandClass().getKey());
+        outputData.write((byte) POWERLEVEL_GET);
+        message.setMessagePayload(outputData.toByteArray());
+        return message;
+    }
+
+    @Override
+    public Collection<SerialMessage> getDynamicValues(boolean refresh) {
+        ArrayList<SerialMessage> result = new ArrayList<SerialMessage>();
 
         if (refresh == true || initialiseDone == false) {
             result.add(getValueMessage());
@@ -134,7 +174,7 @@ public class ZWavePowerLevelCommandClass extends ZWaveCommandClass implements ZW
         private int timeout;
 
         public ZWavePowerLevelCommandClassChangeEvent(int nodeId, int level, int timeout) {
-            super(nodeId, 0, CommandClass.COMMAND_CLASS_POWERLEVEL, level);
+            super(nodeId, 0, CommandClass.POWERLEVEL, level);
             this.timeout = timeout;
         }
 

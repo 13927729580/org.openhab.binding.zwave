@@ -1,5 +1,6 @@
 /**
- * Copyright (c) 2010-2018 by the respective copyright holders.
+ * Copyright (c) 2014-2016 by the respective copyright holders.
+ *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v1.0
  * which accompanies this distribution, and is available at
@@ -7,7 +8,6 @@
  */
 package org.openhab.binding.zwave.internal.protocol.commandclass;
 
-import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -16,14 +16,15 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 
-import org.openhab.binding.zwave.internal.protocol.ZWaveCommandClassPayload;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage.SerialMessageClass;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage.SerialMessagePriority;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage.SerialMessageType;
 import org.openhab.binding.zwave.internal.protocol.ZWaveController;
 import org.openhab.binding.zwave.internal.protocol.ZWaveEndpoint;
 import org.openhab.binding.zwave.internal.protocol.ZWaveNode;
-import org.openhab.binding.zwave.internal.protocol.ZWaveTransaction.TransactionPriority;
+import org.openhab.binding.zwave.internal.protocol.ZWaveSerialMessageException;
 import org.openhab.binding.zwave.internal.protocol.event.ZWaveCommandClassValueEvent;
-import org.openhab.binding.zwave.internal.protocol.transaction.ZWaveCommandClassTransactionPayload;
-import org.openhab.binding.zwave.internal.protocol.transaction.ZWaveCommandClassTransactionPayloadBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -47,9 +48,9 @@ import com.thoughtworks.xstream.annotations.XStreamOmitField;
  *
  * @author Chris Jackson
  */
-@XStreamAlias("COMMAND_CLASS_ALARM")
+@XStreamAlias("alarmCommandClass")
 public class ZWaveAlarmCommandClass extends ZWaveCommandClass
-        implements ZWaveCommandClassDynamicState, ZWaveCommandClassInitialization {
+        implements ZWaveGetCommands, ZWaveCommandClassDynamicState, ZWaveCommandClassInitialization {
 
     @XStreamOmitField
     private final static Logger logger = LoggerFactory.getLogger(ZWaveAlarmCommandClass.class);
@@ -99,36 +100,61 @@ public class ZWaveAlarmCommandClass extends ZWaveCommandClass
         versionMax = MAX_SUPPORTED_VERSION;
     }
 
+    /**
+     * {@inheritDoc}
+     */
     @Override
     public CommandClass getCommandClass() {
-        return CommandClass.COMMAND_CLASS_ALARM;
+        return CommandClass.ALARM;
     }
 
-    @ZWaveResponseHandler(id = NOTIFICATION_REPORT, name = "NOTIFICATION_REPORT")
-    public void handleNotificationReport(ZWaveCommandClassPayload payload, int endpoint) {
-        int v1AlarmTypeCode = payload.getPayloadByte(2);
-        int v1AlarmLevel = payload.getPayloadByte(3);
+    /**
+     * {@inheritDoc}
+     *
+     * @throws ZWaveSerialMessageException
+     */
+    @Override
+    public void handleApplicationCommandRequest(SerialMessage serialMessage, int offset, int endpoint)
+            throws ZWaveSerialMessageException {
+        logger.debug("NODE {}: Received ALARM command V{}", getNode().getNodeId(), getVersion());
+        int command = serialMessage.getMessagePayloadByte(offset);
+        switch (command) {
+            case NOTIFICATION_REPORT:
+                logger.debug("NODE {}: Process NOTIFICATION_REPORT V{}", getNode().getNodeId(), getVersion());
+                processNotificationReport(serialMessage, offset, endpoint);
+                break;
+
+            case NOTIFICATION_SUPPORTED_REPORT:
+                logger.debug("NODE {}: Process NOTIFICATION_SUPPORTED_REPORT", getNode().getNodeId());
+                processNotificationSupportedReport(serialMessage, offset, endpoint);
+                break;
+
+            case EVENT_SUPPORTED_REPORT:
+                logger.debug("NODE {}: Process EVENT_SUPPORTED_REPORT", getNode().getNodeId());
+                processEventSupportedReport(serialMessage, offset, endpoint);
+                break;
+
+            default:
+                logger.debug(String.format("Unsupported Command 0x%02X for command class %s (0x%02X).", command,
+                        getCommandClass().getLabel(), getCommandClass().getKey()));
+                break;
+        }
+    }
+
+    protected void processNotificationReport(SerialMessage serialMessage, int offset, int endpoint)
+            throws ZWaveSerialMessageException {
+        int v1AlarmTypeCode = serialMessage.getMessagePayloadByte(offset + 1);
+        int v1AlarmLevel = serialMessage.getMessagePayloadByte(offset + 2);
         int notificationEvent = 0;
         int notificationStatus = 0;
         int notificationTypeCode = 0;
-        int[] parameters = null;
 
         AlarmType alarmType;
         ReportType eventType;
 
-        if (getVersion() == 1 || payload.getPayloadLength() < 5) {
+        if (getVersion() == 1 || serialMessage.getMessagePayload().length < (offset + 4)) {
             eventType = ReportType.ALARM;
             alarmType = AlarmType.getAlarmType(v1AlarmTypeCode);
-
-            notificationStatus = v1AlarmLevel;
-
-            logger.debug("NODE {}: ALARM report - {} = {}", getNode().getNodeId(), v1AlarmTypeCode, v1AlarmLevel);
-        } else if (getVersion() == 2) {
-            eventType = ReportType.ALARM;
-            notificationStatus = payload.getPayloadByte(5);
-            notificationTypeCode = payload.getPayloadByte(6);
-            notificationEvent = payload.getPayloadByte(7);
-            alarmType = AlarmType.getAlarmType(notificationTypeCode);
 
             notificationStatus = v1AlarmLevel;
 
@@ -136,60 +162,62 @@ public class ZWaveAlarmCommandClass extends ZWaveCommandClass
         } else {
             eventType = ReportType.NOTIFICATION;
             // Indicates if reports are enabled or disabled
-            notificationStatus = payload.getPayloadByte(5);
-            notificationTypeCode = payload.getPayloadByte(6);
-            notificationEvent = payload.getPayloadByte(7);
+            notificationStatus = serialMessage.getMessagePayloadByte(offset + 4);
+            notificationTypeCode = serialMessage.getMessagePayloadByte(offset + 5);
+            notificationEvent = serialMessage.getMessagePayloadByte(offset + 6);
             alarmType = AlarmType.getAlarmType(notificationTypeCode);
 
-            int parameterLength = payload.getPayloadByte(8) & 0x1f;
-            boolean containsSequence = (payload.getPayloadByte(8) & 0x80) != 0;
+            int parameterLength = serialMessage.getMessagePayloadByte(offset + 5) & 0x1f;
+            boolean containsSequence = (serialMessage.getMessagePayloadByte(offset + 5) & 0x80) != 0;
 
-            if (parameterLength != 0) {
-                parameters = new int[parameterLength];
-                for (int cnt = 0; cnt < parameterLength; cnt++) {
-                    parameters[cnt] = payload.getPayloadByte(9 + cnt);
-                }
-            }
-
-            logger.debug("NODE {}: NOTIFICATION report - {} = {}, event={}, status={}, plen={}", getNode().getNodeId(),
-                    v1AlarmTypeCode, v1AlarmLevel, notificationEvent, notificationStatus, parameterLength);
+            logger.debug("NODE {}: NOTIFICATION report - {} = {}, event={}, status={}", getNode().getNodeId(),
+                    v1AlarmTypeCode, v1AlarmLevel, notificationEvent, notificationStatus);
         }
 
-        if (alarmType != null) {
-            // Alarm type seems to be supported, add it to the list.
-            Alarm alarm = alarms.get(alarmType);
-            if (alarm == null) {
-                alarm = new Alarm(alarmType);
-                alarms.put(alarmType, alarm);
-            }
-            alarm.setInitialised();
+        if (alarmType == null) {
+            logger.debug("NODE {}: Unknown Alarm Type = {}, ignoring report.", getNode().getNodeId(), v1AlarmTypeCode);
+            return;
         }
 
-        logger.debug("NODE {}: Alarm Type = {} ({})", getNode().getNodeId(), alarmType, v1AlarmTypeCode);
-
-        ZWaveAlarmValueEvent event = new ZWaveAlarmValueEvent(getNode().getNodeId(), endpoint, eventType, alarmType,
-                v1AlarmTypeCode, v1AlarmLevel, notificationEvent, notificationStatus);
-        if (parameters != null) {
-            event.setParameters(parameters);
+        // Alarm type seems to be supported, add it to the list.
+        Alarm alarm = alarms.get(alarmType);
+        if (alarm == null) {
+            alarm = new Alarm(alarmType);
+            alarms.put(alarmType, alarm);
         }
+        alarm.setInitialised();
 
-        getController().notifyEventListeners(event);
+        logger.debug("NODE {}: Alarm Type = {} ({})", getNode().getNodeId(), alarmType.toString(), v1AlarmTypeCode);
+
+        ZWaveAlarmValueEvent zEvent = new ZWaveAlarmValueEvent(getNode().getNodeId(), endpoint, eventType, alarmType,
+                notificationEvent, notificationStatus);
+        getController().notifyEventListeners(zEvent);
 
         dynamicDone = true;
     }
 
-    @ZWaveResponseHandler(id = NOTIFICATION_SUPPORTED_REPORT, name = "NOTIFICATION_SUPPORTED_REPORT")
-    public void handleNotificationSupportedReport(ZWaveCommandClassPayload payload, int endpoint) {
+    /**
+     * Process NOTIFICATION_SUPPORTED_REPORT
+     *
+     * @param serialMessage
+     * @param offset
+     * @param endpoint
+     * @throws ZWaveSerialMessageException
+     */
+    protected void processNotificationSupportedReport(SerialMessage serialMessage, int offset, int endpoint)
+            throws ZWaveSerialMessageException {
+
         // Check if this is a V1 alarm report
-        v1Supported = (payload.getPayloadByte(2) & 0x80) == 0;
+        v1Supported = (serialMessage.getMessagePayloadByte(offset + 1) & 0x80) == 0;
         if (v1Supported) {
             logger.debug("NODE: NOTIFICATION_SUPPORTED_REPORT reports V1 ALARM support", getNode().getNodeId());
+
         }
 
-        int numBytes = payload.getPayloadByte(2) & 0x1f;
+        int numBytes = serialMessage.getMessagePayloadByte(offset + 1) & 0x1f;
         for (int i = 0; i < numBytes; ++i) {
             for (int bit = 0; bit < 8; ++bit) {
-                if (((payload.getPayloadByte(i + 3)) & (1 << bit)) == 0) {
+                if (((serialMessage.getMessagePayloadByte(offset + i + 2)) & (1 << bit)) == 0) {
                     continue;
                 }
 
@@ -206,14 +234,22 @@ public class ZWaveAlarmCommandClass extends ZWaveCommandClass
         supportedInitialised = true;
     }
 
-    @ZWaveResponseHandler(id = EVENT_SUPPORTED_REPORT, name = "EVENT_SUPPORTED_REPORT")
-    public void handleEventSupportedReport(ZWaveCommandClassPayload payload, int endpoint) {
-        int notificationType = payload.getPayloadByte(2);
-        int numBytes = payload.getPayloadByte(3) & 0x1f;
+    /**
+     * Process EVENT_SUPPORTED_REPORT
+     *
+     * @param serialMessage
+     * @param offset
+     * @param endpoint
+     * @throws ZWaveSerialMessageException
+     */
+    protected void processEventSupportedReport(SerialMessage serialMessage, int offset, int endpoint)
+            throws ZWaveSerialMessageException {
+        int notificationType = serialMessage.getMessagePayloadByte(offset + 1);
+        int numBytes = serialMessage.getMessagePayloadByte(offset + 2) & 0x1f;
         List<Integer> types = new ArrayList<>();
         for (int i = 0; i < numBytes; ++i) {
             for (int bit = 0; bit < 8; ++bit) {
-                if (((payload.getPayloadByte(i + 4)) & (1 << bit)) == 0) {
+                if (((serialMessage.getMessagePayloadByte(offset + i + 3)) & (1 << bit)) == 0) {
                     continue;
                 }
 
@@ -254,7 +290,7 @@ public class ZWaveAlarmCommandClass extends ZWaveCommandClass
      * @param event
      * @return
      */
-    public ZWaveCommandClassTransactionPayload getNotificationReportMessage(AlarmType notificationType, int event) {
+    public SerialMessage getNotificationReportMessage(AlarmType notificationType, int event) {
         if (getVersion() == 1) {
             logger.debug("NODE {}: NOTIFICATION_REPORT not supported for V1", getNode().getNodeId());
             return null;
@@ -262,18 +298,22 @@ public class ZWaveAlarmCommandClass extends ZWaveCommandClass
 
         logger.debug("NODE {}: Creating new message for command NOTIFICATION_REPORT", getNode().getNodeId());
 
-        return new ZWaveCommandClassTransactionPayloadBuilder(getNode().getNodeId(), getCommandClass(),
-                NOTIFICATION_REPORT).withPayload(0, 0, 0, 0xff, notificationType.getKey(), event)
-                        .withPriority(TransactionPriority.High).build();
+        SerialMessage result = new SerialMessage(getNode().getNodeId(), SerialMessageClass.SendData,
+                SerialMessageType.Request, SerialMessageClass.SendData, SerialMessagePriority.High);
+        byte[] newPayload = { (byte) getNode().getNodeId(), 8, (byte) getCommandClass().getKey(),
+                (byte) NOTIFICATION_REPORT, 0, 0, 0, (byte) 0xff, (byte) notificationType.getKey(), (byte) event };
+        result.setMessagePayload(newPayload);
+        return result;
     }
 
     /**
-     * Gets a SerialMessage with the ALARM_GET command.
-     * This just gets the first alarm!
+     * Gets a SerialMessage with the ALARM_GET command
      *
      * @return the serial message
      */
-    public ZWaveCommandClassTransactionPayload getValueMessage() {
+    @Override
+    public SerialMessage getValueMessage() {
+        // TODO: Why does this return!!!???!!!
         // TODO Is this used
         for (Map.Entry<AlarmType, Alarm> entry : alarms.entrySet()) {
             return getMessage(entry.getValue().getAlarmType(), 0);
@@ -287,7 +327,7 @@ public class ZWaveAlarmCommandClass extends ZWaveCommandClass
      *
      * @return the serial message, or null if the supported command is not supported.
      */
-    public ZWaveCommandClassTransactionPayload getSupportedMessage() {
+    public SerialMessage getSupportedMessage() {
         if (getVersion() == 1) {
             logger.debug("NODE {}: NOTIFICATION_SUPPORTED_GET not supported for V1", getNode().getNodeId());
             return null;
@@ -295,9 +335,12 @@ public class ZWaveAlarmCommandClass extends ZWaveCommandClass
 
         logger.debug("NODE {}: Creating new message for command NOTIFICATION_SUPPORTED_GET", getNode().getNodeId());
 
-        return new ZWaveCommandClassTransactionPayloadBuilder(getNode().getNodeId(), getCommandClass(),
-                NOTIFICATION_SUPPORTED_GET).withExpectedResponseCommand(NOTIFICATION_SUPPORTED_REPORT)
-                        .withPriority(TransactionPriority.Config).build();
+        SerialMessage result = new SerialMessage(getNode().getNodeId(), SerialMessageClass.SendData,
+                SerialMessageType.Request, SerialMessageClass.ApplicationCommandHandler, SerialMessagePriority.High);
+        byte[] newPayload = { (byte) getNode().getNodeId(), 2, (byte) getCommandClass().getKey(),
+                (byte) NOTIFICATION_SUPPORTED_GET };
+        result.setMessagePayload(newPayload);
+        return result;
     }
 
     /**
@@ -305,18 +348,21 @@ public class ZWaveAlarmCommandClass extends ZWaveCommandClass
      *
      * @return the serial message, or null if the supported command is not supported.
      */
-    public ZWaveCommandClassTransactionPayload getSupportedEventMessage(int index) {
-        if (getVersion() < 2) {
+    public SerialMessage getSupportedEventMessage(int index) {
+        if (getVersion() == 1) {
             logger.debug("NODE {}: EVENT_SUPPORTED_GET not supported for V1-2", getNode().getNodeId());
             return null;
         }
 
         logger.debug("NODE {}: Creating new message for command EVENT_SUPPORTED_GET", getNode().getNodeId());
 
-        return new ZWaveCommandClassTransactionPayloadBuilder(getNode().getNodeId(), getCommandClass(),
-                EVENT_SUPPORTED_GET).withPayload(new byte[] { (byte) index })
-                        .withExpectedResponseCommand(EVENT_SUPPORTED_REPORT).withPriority(TransactionPriority.Config)
-                        .build();
+        SerialMessage result = new SerialMessage(getNode().getNodeId(), SerialMessageClass.SendData,
+                SerialMessageType.Request, SerialMessageClass.ApplicationCommandHandler, SerialMessagePriority.High);
+        byte[] newPayload = { (byte) getNode().getNodeId(), 3, (byte) getCommandClass().getKey(),
+                (byte) EVENT_SUPPORTED_GET, (byte) index };
+        result.setMessagePayload(newPayload);
+
+        return result;
     }
 
     /**
@@ -324,7 +370,7 @@ public class ZWaveAlarmCommandClass extends ZWaveCommandClass
      *
      * @return the serial message
      */
-    public ZWaveCommandClassTransactionPayload getMessage(AlarmType alarmType, Integer alarmEvent) {
+    public SerialMessage getMessage(AlarmType alarmType, int event) {
         if (isGetSupported == false) {
             logger.debug("NODE {}: Node doesn't support get requests", getNode().getNodeId());
             return null;
@@ -333,41 +379,46 @@ public class ZWaveAlarmCommandClass extends ZWaveCommandClass
         logger.debug("NODE {}: Creating new message for application command NOTIFICATION_GET V{}",
                 getNode().getNodeId(), getVersion());
 
-        ByteArrayOutputStream outputData = new ByteArrayOutputStream();
+        SerialMessage result = new SerialMessage(getNode().getNodeId(), SerialMessageClass.SendData,
+                SerialMessageType.Request, SerialMessageClass.ApplicationCommandHandler, SerialMessagePriority.Get);
+        byte[] newPayload = null;
         switch (getVersion()) {
             case 1:
-                outputData.write(alarmType.getKey());
+                newPayload = new byte[] { (byte) getNode().getNodeId(), 3, (byte) getCommandClass().getKey(),
+                        (byte) NOTIFICATION_GET, (byte) alarmType.getKey() };
+                result.setMessagePayload(newPayload);
                 break;
             case 2:
-                outputData.write(0);
-                outputData.write(alarmType.getKey());
+                newPayload = new byte[] { (byte) getNode().getNodeId(), 4, (byte) getCommandClass().getKey(),
+                        (byte) NOTIFICATION_GET, 0, (byte) alarmType.getKey() };
                 break;
-            case 3:
             default:
+            case 3:
                 // Notifications can't be polled for their state
                 // This will return an event that allows us to know if the event is configured for pull or push
                 // and not the actual state of the event.
                 return null;
         }
 
-        return new ZWaveCommandClassTransactionPayloadBuilder(getNode().getNodeId(), getCommandClass(),
-                NOTIFICATION_GET).withPayload(outputData.toByteArray()).withExpectedResponseCommand(NOTIFICATION_REPORT)
-                        .withPriority(TransactionPriority.Config).build();
+        result.setMessagePayload(newPayload);
+        return result;
     }
 
     @Override
-    public Collection<ZWaveCommandClassTransactionPayload> initialize(boolean refresh) {
-        ArrayList<ZWaveCommandClassTransactionPayload> result = new ArrayList<ZWaveCommandClassTransactionPayload>();
+    public Collection<SerialMessage> initialize(boolean refresh) {
+        ArrayList<SerialMessage> result = new ArrayList<SerialMessage>();
 
         if (refresh == true) {
             supportedInitialised = false;
             eventsSupportedInitialised = false;
         }
 
+        // First get a list of all the notifications supported
         if (getVersion() > 1 && supportedInitialised == false) {
             result.add(getSupportedMessage());
         }
 
+        // Once we have all the notifications, get a list of all the events
         if (getVersion() > 2 && eventsSupportedInitialised == false) {
             for (Entry<AlarmType, Alarm> alarmEntry : alarms.entrySet()) {
                 if (alarmEntry.getValue().getReportedEvents().isEmpty()) {
@@ -377,15 +428,6 @@ public class ZWaveAlarmCommandClass extends ZWaveCommandClass
         }
 
         return result;
-    }
-
-    @Override
-    public boolean setOptions(Map<String, String> options) {
-        if ("false".equals(options.get("getSupported"))) {
-            isGetSupported = false;
-        }
-
-        return true;
     }
 
     /**
@@ -398,8 +440,8 @@ public class ZWaveAlarmCommandClass extends ZWaveCommandClass
     }
 
     @Override
-    public Collection<ZWaveCommandClassTransactionPayload> getDynamicValues(boolean refresh) {
-        ArrayList<ZWaveCommandClassTransactionPayload> result = new ArrayList<ZWaveCommandClassTransactionPayload>();
+    public Collection<SerialMessage> getDynamicValues(boolean refresh) {
+        ArrayList<SerialMessage> result = new ArrayList<SerialMessage>();
 
         for (Map.Entry<AlarmType, Alarm> entry : alarms.entrySet()) {
             if (refresh == true || entry.getValue().getInitialised() == false) {
@@ -414,6 +456,16 @@ public class ZWaveAlarmCommandClass extends ZWaveCommandClass
         }
 
         return result;
+    }
+
+    @Override
+    public boolean setOptions(Map<String, String> options) {
+        // TODO: False logic!
+        if ("false".equals(options.get("getSupported"))) {
+            isGetSupported = false;
+        }
+
+        return true;
     }
 
     /**
@@ -520,9 +572,6 @@ public class ZWaveAlarmCommandClass extends ZWaveCommandClass
         private AlarmType alarmType;
         private int alarmEvent;
         private int alarmStatus;
-        private int v1AlarmCode;
-        private int v1AlarmLevel;
-        private int[] parameters;
 
         /**
          * Constructor. Creates a instance of the ZWaveAlarmValueEvent class.
@@ -531,27 +580,15 @@ public class ZWaveAlarmCommandClass extends ZWaveCommandClass
          * @param endpoint the endpoint of the event.
          * @param eventType
          * @param alarmType the alarm type that triggered the event;
-         * @param v1AlarmCode
-         * @param alarmEvent
-         * @param alarmStatus
+         * @param value the value for the event.
          */
-        public ZWaveAlarmValueEvent(int nodeId, int endpoint, ReportType eventType, AlarmType alarmType,
-                int v1AlarmCode, int v1AlarmLevel, int alarmEvent, int alarmStatus) {
-            super(nodeId, endpoint, CommandClass.COMMAND_CLASS_ALARM, alarmStatus);
+        public ZWaveAlarmValueEvent(int nodeId, int endpoint, ReportType eventType, AlarmType alarmType, int alarmEvent,
+                int alarmStatus) {
+            super(nodeId, endpoint, CommandClass.ALARM, alarmStatus);
             this.eventType = eventType;
             this.alarmType = alarmType;
             this.alarmEvent = alarmEvent;
             this.alarmStatus = alarmStatus;
-            this.v1AlarmCode = v1AlarmCode;
-            this.v1AlarmLevel = v1AlarmLevel;
-        }
-
-        public void setParameters(int[] parameters) {
-            this.parameters = parameters;
-        }
-
-        public int[] getParameters() {
-            return parameters;
         }
 
         /**
@@ -580,14 +617,6 @@ public class ZWaveAlarmCommandClass extends ZWaveCommandClass
          */
         public int getAlarmStatus() {
             return alarmStatus;
-        }
-
-        public int getV1AlarmCode() {
-            return v1AlarmCode;
-        }
-
-        public int getV1AlarmLevel() {
-            return v1AlarmLevel;
         }
 
         @Override

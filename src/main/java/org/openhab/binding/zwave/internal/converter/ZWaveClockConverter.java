@@ -1,5 +1,6 @@
 /**
- * Copyright (c) 2010-2018 by the respective copyright holders.
+ * Copyright (c) 2014-2016 by the respective copyright holders.
+ *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v1.0
  * which accompanies this distribution, and is available at
@@ -17,11 +18,11 @@ import org.eclipse.smarthome.core.types.Command;
 import org.eclipse.smarthome.core.types.State;
 import org.openhab.binding.zwave.handler.ZWaveControllerHandler;
 import org.openhab.binding.zwave.handler.ZWaveThingChannel;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage;
 import org.openhab.binding.zwave.internal.protocol.ZWaveNode;
 import org.openhab.binding.zwave.internal.protocol.commandclass.ZWaveClockCommandClass;
 import org.openhab.binding.zwave.internal.protocol.commandclass.ZWaveCommandClass;
 import org.openhab.binding.zwave.internal.protocol.event.ZWaveCommandClassValueEvent;
-import org.openhab.binding.zwave.internal.protocol.transaction.ZWaveCommandClassTransactionPayload;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -32,7 +33,7 @@ import org.slf4j.LoggerFactory;
  */
 public class ZWaveClockConverter extends ZWaveCommandClassConverter {
 
-    private final Logger logger = LoggerFactory.getLogger(ZWaveClockConverter.class);
+    private final static Logger logger = LoggerFactory.getLogger(ZWaveClockConverter.class);
 
     private Calendar lastClockUpdate = Calendar.getInstance();
 
@@ -44,23 +45,29 @@ public class ZWaveClockConverter extends ZWaveCommandClassConverter {
         super(controller);
     }
 
+    /**
+     * {@inheritDoc}
+     */
     @Override
-    public List<ZWaveCommandClassTransactionPayload> executeRefresh(ZWaveThingChannel channel, ZWaveNode node) {
+    public List<SerialMessage> executeRefresh(ZWaveThingChannel channel, ZWaveNode node) {
         ZWaveClockCommandClass commandClass = (ZWaveClockCommandClass) node
-                .resolveCommandClass(ZWaveCommandClass.CommandClass.COMMAND_CLASS_CLOCK, channel.getEndpoint());
+                .resolveCommandClass(ZWaveCommandClass.CommandClass.CLOCK, channel.getEndpoint());
         if (commandClass == null) {
             return null;
         }
 
         logger.debug("NODE {}: Generating poll message for {} endpoint {}", node.getNodeId(),
-                commandClass.getCommandClass(), channel.getEndpoint());
-        ZWaveCommandClassTransactionPayload transaction = node.encapsulate(commandClass.getValueMessage(),
+                commandClass.getCommandClass().getLabel(), channel.getEndpoint());
+        SerialMessage serialMessage = node.encapsulate(commandClass.getValueMessage(), commandClass,
                 channel.getEndpoint());
-        List<ZWaveCommandClassTransactionPayload> response = new ArrayList<ZWaveCommandClassTransactionPayload>(1);
-        response.add(transaction);
+        List<SerialMessage> response = new ArrayList<SerialMessage>(1);
+        response.add(serialMessage);
         return response;
     }
 
+    /**
+     * {@inheritDoc}
+     */
     @Override
     public State handleEvent(ZWaveThingChannel channel, ZWaveCommandClassValueEvent event) {
         int offsetAllowed = Integer.MAX_VALUE;
@@ -83,17 +90,17 @@ public class ZWaveClockConverter extends ZWaveCommandClassConverter {
                             clockOffset);
 
                     ZWaveNode node = controller.getNode(event.getNodeId());
-                    ZWaveClockCommandClass commandClass = (ZWaveClockCommandClass) node.resolveCommandClass(
-                            ZWaveCommandClass.CommandClass.COMMAND_CLASS_CLOCK, channel.getEndpoint());
+                    ZWaveClockCommandClass commandClass = (ZWaveClockCommandClass) node
+                            .resolveCommandClass(ZWaveCommandClass.CommandClass.CLOCK, channel.getEndpoint());
 
-                    ZWaveCommandClassTransactionPayload transaction = node
-                            .encapsulate(commandClass.getSetMessage(Calendar.getInstance()), channel.getEndpoint());
-                    if (transaction == null) {
+                    SerialMessage serialMessage = node.encapsulate(commandClass.getSetMessage(Calendar.getInstance()),
+                            commandClass, channel.getEndpoint());
+                    if (serialMessage == null) {
                         logger.warn("Generating message failed for command class = {}, node = {}, endpoint = {}",
-                                commandClass.getCommandClass(), node.getNodeId(), channel.getEndpoint());
+                                commandClass.getCommandClass().getLabel(), node.getNodeId(), channel.getEndpoint());
                         return null;
                     } else {
-                        controller.sendData(transaction);
+                        controller.sendData(serialMessage);
                     }
 
                     // We keep track of the last time we set the time to avoid a pathalogical loop if the time set
@@ -101,13 +108,14 @@ public class ZWaveClockConverter extends ZWaveCommandClassConverter {
                     lastClockUpdate = Calendar.getInstance();
 
                     // And request a read-back
-                    transaction = node.encapsulate(commandClass.getValueMessage(), channel.getEndpoint());
-                    if (transaction == null) {
+                    serialMessage = node.encapsulate(commandClass.getValueMessage(), commandClass,
+                            channel.getEndpoint());
+                    if (serialMessage == null) {
                         logger.warn("Generating message failed for command class = {}, node = {}, endpoint = {}",
-                                commandClass.getCommandClass(), node.getNodeId(), channel.getEndpoint());
+                                commandClass.getCommandClass().getLabel(), node.getNodeId(), channel.getEndpoint());
                         return null;
                     } else {
-                        controller.sendData(transaction);
+                        controller.sendData(serialMessage);
                     }
                 }
 
@@ -121,22 +129,24 @@ public class ZWaveClockConverter extends ZWaveCommandClassConverter {
         return state;
     }
 
+    /**
+     * {@inheritDoc}
+     */
     @Override
-    public List<ZWaveCommandClassTransactionPayload> receiveCommand(ZWaveThingChannel channel, ZWaveNode node,
-            Command command) {
+    public List<SerialMessage> receiveCommand(ZWaveThingChannel channel, ZWaveNode node, Command command) {
         ZWaveClockCommandClass commandClass = (ZWaveClockCommandClass) node
-                .resolveCommandClass(ZWaveCommandClass.CommandClass.COMMAND_CLASS_CLOCK, channel.getEndpoint());
+                .resolveCommandClass(ZWaveCommandClass.CommandClass.CLOCK, channel.getEndpoint());
 
-        ZWaveCommandClassTransactionPayload transaction = node
-                .encapsulate(commandClass.getSetMessage(Calendar.getInstance()), channel.getEndpoint());
-        if (transaction == null) {
+        SerialMessage serialMessage = node.encapsulate(commandClass.getSetMessage(Calendar.getInstance()), commandClass,
+                channel.getEndpoint());
+        if (serialMessage == null) {
             logger.warn("Generating message failed for command class = {}, node = {}, endpoint = {}",
-                    commandClass.getCommandClass(), node.getNodeId(), channel.getEndpoint());
+                    commandClass.getCommandClass().getLabel(), node.getNodeId(), channel.getEndpoint());
             return null;
         }
 
-        List<ZWaveCommandClassTransactionPayload> messages = new ArrayList<ZWaveCommandClassTransactionPayload>();
-        messages.add(transaction);
+        List<SerialMessage> messages = new ArrayList<SerialMessage>();
+        messages.add(serialMessage);
         return messages;
     }
 }

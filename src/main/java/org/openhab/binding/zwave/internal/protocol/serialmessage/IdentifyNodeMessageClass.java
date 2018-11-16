@@ -1,5 +1,6 @@
 /**
- * Copyright (c) 2010-2018 by the respective copyright holders.
+ * Copyright (c) 2014-2016 by the respective copyright holders.
+ *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v1.0
  * which accompanies this distribution, and is available at
@@ -9,6 +10,8 @@ package org.openhab.binding.zwave.internal.protocol.serialmessage;
 
 import org.openhab.binding.zwave.internal.protocol.SerialMessage;
 import org.openhab.binding.zwave.internal.protocol.SerialMessage.SerialMessageClass;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage.SerialMessagePriority;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage.SerialMessageType;
 import org.openhab.binding.zwave.internal.protocol.ZWaveController;
 import org.openhab.binding.zwave.internal.protocol.ZWaveDeviceClass;
 import org.openhab.binding.zwave.internal.protocol.ZWaveDeviceClass.Basic;
@@ -16,11 +19,8 @@ import org.openhab.binding.zwave.internal.protocol.ZWaveDeviceClass.Generic;
 import org.openhab.binding.zwave.internal.protocol.ZWaveDeviceClass.Specific;
 import org.openhab.binding.zwave.internal.protocol.ZWaveNode;
 import org.openhab.binding.zwave.internal.protocol.ZWaveSerialMessageException;
-import org.openhab.binding.zwave.internal.protocol.ZWaveSerialPayload;
-import org.openhab.binding.zwave.internal.protocol.ZWaveTransaction;
 import org.openhab.binding.zwave.internal.protocol.commandclass.ZWaveCommandClass;
 import org.openhab.binding.zwave.internal.protocol.commandclass.ZWaveCommandClass.CommandClass;
-import org.openhab.binding.zwave.internal.protocol.transaction.ZWaveTransactionMessageBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -30,26 +30,29 @@ import org.slf4j.LoggerFactory;
  * @author Chris Jackson
  */
 public class IdentifyNodeMessageClass extends ZWaveCommandProcessor {
-    private final Logger logger = LoggerFactory.getLogger(IdentifyNodeMessageClass.class);
+    private final static Logger logger = LoggerFactory.getLogger(IdentifyNodeMessageClass.class);
 
-    public ZWaveSerialPayload doRequest(int nodeId) {
-        // Create the request
-        return new ZWaveTransactionMessageBuilder(SerialMessageClass.IdentifyNode).withPayload(nodeId).build();
-        // .withResponseNodeId(nodeId).build();
+    public SerialMessage doRequest(int nodeId) {
+        SerialMessage newMessage = new SerialMessage(SerialMessageClass.IdentifyNode, SerialMessageType.Request,
+                SerialMessageClass.IdentifyNode, SerialMessagePriority.High);
+        byte[] newPayload = { (byte) nodeId };
+        newMessage.setMessagePayload(newPayload);
+        return newMessage;
     }
 
     @Override
-    public boolean handleResponse(ZWaveController zController, ZWaveTransaction transaction,
+    public boolean handleResponse(ZWaveController zController, SerialMessage lastSentMessage,
             SerialMessage incomingMessage) throws ZWaveSerialMessageException {
         logger.trace("Handle Message Get Node ProtocolInfo Response");
 
-        if (transaction == null) {
+        // Check that this request is consistent with the response
+        if (lastSentMessage.getMessageClass() != SerialMessageClass.IdentifyNode) {
+            logger.warn("Got IdentifyNodeMessage without request, ignoring. Last message was {}.",
+                    lastSentMessage.getMessageClass());
             return false;
         }
-        if (transaction.getSerialMessage() == null) {
-            return false;
-        }
-        int nodeId = transaction.getSerialMessage().getMessagePayloadByte(0);
+
+        int nodeId = lastSentMessage.getMessagePayloadByte(0);
         logger.debug("NODE {}: ProtocolInfo", nodeId);
 
         ZWaveNode node = zController.getNode(nodeId);
@@ -65,19 +68,18 @@ public class IdentifyNodeMessageClass extends ZWaveCommandProcessor {
         boolean beaming = ((incomingMessage.getMessagePayloadByte(1) & 0x10) != 0);
         boolean security = ((incomingMessage.getMessagePayloadByte(1) & 0x01) != 0);
 
-        // TODO: How about the 100kbps option?
         int maxBaudRate = 9600;
         if ((incomingMessage.getMessagePayloadByte(0) & 0x38) == 0x10) {
             maxBaudRate = 40000;
         }
 
         logger.debug("NODE {}: Listening = {}", nodeId, listening);
-        logger.debug("NODE {}: Routing   = {}", nodeId, routing);
-        logger.debug("NODE {}: Beaming   = {}", nodeId, beaming);
-        logger.debug("NODE {}: Version   = {}", nodeId, version);
-        logger.debug("NODE {}: FLIRS     = {}", nodeId, frequentlyListening);
-        logger.debug("NODE {}: Security  = {}", nodeId, security);
-        logger.debug("NODE {}: Max Baud  = {}", nodeId, maxBaudRate);
+        logger.debug("NODE {}: Routing = {}", nodeId, routing);
+        logger.debug("NODE {}: Beaming = {}", nodeId, beaming);
+        logger.debug("NODE {}: Version = {}", nodeId, version);
+        logger.debug("NODE {}: FLIRS = {}", nodeId, frequentlyListening);
+        logger.debug("NODE {}: Security = {}", nodeId, security);
+        logger.debug("NODE {}: Max Baud = {}", nodeId, maxBaudRate);
 
         node.setListening(listening);
         node.setRouting(routing);
@@ -92,7 +94,7 @@ public class IdentifyNodeMessageClass extends ZWaveCommandProcessor {
             logger.debug("NODE {}: Basic device class {} not found", nodeId, incomingMessage.getMessagePayloadByte(3));
             return false;
         }
-        logger.debug("NODE {}: Basic    = {}", nodeId, basic.toString());
+        logger.debug("NODE {}: Basic = {}", nodeId, basic.getLabel());
 
         Generic generic = Generic.getGeneric(incomingMessage.getMessagePayloadByte(4));
         if (generic == null) {
@@ -100,7 +102,7 @@ public class IdentifyNodeMessageClass extends ZWaveCommandProcessor {
                     incomingMessage.getMessagePayloadByte(4));
             return false;
         }
-        logger.debug("NODE {}: Generic  = {}", nodeId, generic.toString());
+        logger.debug("NODE {}: Generic = {}", nodeId, generic.getLabel());
 
         Specific specific = Specific.getSpecific(generic, incomingMessage.getMessagePayloadByte(5));
         if (specific == null) {
@@ -108,22 +110,37 @@ public class IdentifyNodeMessageClass extends ZWaveCommandProcessor {
                     incomingMessage.getMessagePayloadByte(5));
             return false;
         }
-        logger.debug("NODE {}: Specific = {}", nodeId, specific.toString());
+        logger.debug("NODE {}: Specific = {}", nodeId, specific.getLabel());
 
         ZWaveDeviceClass deviceClass = node.getDeviceClass();
         deviceClass.setBasicDeviceClass(basic);
         deviceClass.setGenericDeviceClass(generic);
         deviceClass.setSpecificDeviceClass(specific);
 
-        // Add the mandatory command classes.
+        // Add all the command classes.
         // If restored the node from configuration file then
         // the classes will already exist and this will be ignored
-        node.addCommandClass(
-                ZWaveCommandClass.getInstance(CommandClass.COMMAND_CLASS_NO_OPERATION.getKey(), node, zController));
-        node.addCommandClass(
-                ZWaveCommandClass.getInstance(CommandClass.COMMAND_CLASS_BASIC.getKey(), node, zController));
 
-        transaction.setTransactionComplete();
+        // Add mandatory command classes as specified by it's generic device class.
+        for (CommandClass commandClass : generic.getMandatoryCommandClasses()) {
+            ZWaveCommandClass zwaveCommandClass = ZWaveCommandClass.getInstance(commandClass.getKey(), node,
+                    zController);
+            if (zwaveCommandClass != null) {
+                zController.getNode(nodeId).addCommandClass(zwaveCommandClass);
+            }
+        }
+
+        // Add mandatory command classes as specified by it's specific device class.
+        for (CommandClass commandClass : specific.getMandatoryCommandClasses()) {
+            ZWaveCommandClass zwaveCommandClass = ZWaveCommandClass.getInstance(commandClass.getKey(), node,
+                    zController);
+            if (zwaveCommandClass != null) {
+                node.addCommandClass(zwaveCommandClass);
+            }
+        }
+
+        checkTransactionComplete(lastSentMessage, incomingMessage);
+
         return true;
     }
 }

@@ -1,5 +1,6 @@
 /**
- * Copyright (c) 2010-2018 by the respective copyright holders.
+ * Copyright (c) 2014-2016 by the respective copyright holders.
+ *
  * All rights reserved. This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License v1.0
  * which accompanies this distribution, and is available at
@@ -17,15 +18,20 @@ import java.util.Set;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.PriorityBlockingQueue;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import org.eclipse.jdt.annotation.Nullable;
 import org.openhab.binding.zwave.internal.protocol.SerialMessage.SerialMessageClass;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage.SerialMessagePriority;
+import org.openhab.binding.zwave.internal.protocol.SerialMessage.SerialMessageType;
 import org.openhab.binding.zwave.internal.protocol.ZWaveDeviceClass.Basic;
-import org.openhab.binding.zwave.internal.protocol.ZWaveTransaction.TransactionState;
 import org.openhab.binding.zwave.internal.protocol.commandclass.ZWaveCommandClass;
+import org.openhab.binding.zwave.internal.protocol.commandclass.ZWaveCommandClass.CommandClass;
 import org.openhab.binding.zwave.internal.protocol.commandclass.ZWaveMultiInstanceCommandClass;
 import org.openhab.binding.zwave.internal.protocol.commandclass.ZWaveSecurityCommandClass;
+import org.openhab.binding.zwave.internal.protocol.commandclass.ZWaveWakeUpCommandClass;
 import org.openhab.binding.zwave.internal.protocol.event.ZWaveEvent;
 import org.openhab.binding.zwave.internal.protocol.event.ZWaveInclusionEvent;
 import org.openhab.binding.zwave.internal.protocol.event.ZWaveInitializationStateEvent;
@@ -35,10 +41,13 @@ import org.openhab.binding.zwave.internal.protocol.event.ZWaveNodeStatusEvent;
 import org.openhab.binding.zwave.internal.protocol.event.ZWaveTransactionCompletedEvent;
 import org.openhab.binding.zwave.internal.protocol.initialization.ZWaveNodeInitStage;
 import org.openhab.binding.zwave.internal.protocol.initialization.ZWaveNodeSerializer;
+import org.openhab.binding.zwave.internal.protocol.security.SecurityEncapsulatedSerialMessage;
+import org.openhab.binding.zwave.internal.protocol.serialmessage.AddNodeMessageClass;
 import org.openhab.binding.zwave.internal.protocol.serialmessage.AssignReturnRouteMessageClass;
 import org.openhab.binding.zwave.internal.protocol.serialmessage.AssignSucReturnRouteMessageClass;
 import org.openhab.binding.zwave.internal.protocol.serialmessage.ControllerSetDefaultMessageClass;
 import org.openhab.binding.zwave.internal.protocol.serialmessage.DeleteReturnRouteMessageClass;
+import org.openhab.binding.zwave.internal.protocol.serialmessage.EnableSucMessageClass;
 import org.openhab.binding.zwave.internal.protocol.serialmessage.GetControllerCapabilitiesMessageClass;
 import org.openhab.binding.zwave.internal.protocol.serialmessage.GetRoutingInfoMessageClass;
 import org.openhab.binding.zwave.internal.protocol.serialmessage.GetSucNodeIdMessageClass;
@@ -47,16 +56,18 @@ import org.openhab.binding.zwave.internal.protocol.serialmessage.IdentifyNodeMes
 import org.openhab.binding.zwave.internal.protocol.serialmessage.IsFailedNodeMessageClass;
 import org.openhab.binding.zwave.internal.protocol.serialmessage.MemoryGetIdMessageClass;
 import org.openhab.binding.zwave.internal.protocol.serialmessage.RemoveFailedNodeMessageClass;
+import org.openhab.binding.zwave.internal.protocol.serialmessage.RemoveNodeMessageClass;
 import org.openhab.binding.zwave.internal.protocol.serialmessage.ReplaceFailedNodeMessageClass;
 import org.openhab.binding.zwave.internal.protocol.serialmessage.RequestNetworkUpdateMessageClass;
+import org.openhab.binding.zwave.internal.protocol.serialmessage.RequestNodeInfoMessageClass;
 import org.openhab.binding.zwave.internal.protocol.serialmessage.RequestNodeNeighborUpdateMessageClass;
+import org.openhab.binding.zwave.internal.protocol.serialmessage.SendDataMessageClass;
 import org.openhab.binding.zwave.internal.protocol.serialmessage.SerialApiGetCapabilitiesMessageClass;
 import org.openhab.binding.zwave.internal.protocol.serialmessage.SerialApiGetInitDataMessageClass;
 import org.openhab.binding.zwave.internal.protocol.serialmessage.SerialApiSetTimeoutsMessageClass;
 import org.openhab.binding.zwave.internal.protocol.serialmessage.SerialApiSoftResetMessageClass;
 import org.openhab.binding.zwave.internal.protocol.serialmessage.SetSucNodeMessageClass;
 import org.openhab.binding.zwave.internal.protocol.serialmessage.ZWaveCommandProcessor;
-import org.openhab.binding.zwave.internal.protocol.transaction.ZWaveCommandClassTransactionPayload;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -69,9 +80,13 @@ import org.slf4j.LoggerFactory;
  * @author Brian Crosby
  */
 public class ZWaveController {
-    private final Logger logger = LoggerFactory.getLogger(ZWaveController.class);
+
+    private final static Logger logger = LoggerFactory.getLogger(ZWaveController.class);
 
     private static final int ZWAVE_RESPONSE_TIMEOUT = 5000;
+    private static final int INITIAL_TX_QUEUE_SIZE = 128;
+    private static final int INITIAL_RX_QUEUE_SIZE = 8;
+    private static final long WATCHDOG_TIMER_PERIOD = 10000;
 
     public static final int TRANSMIT_OPTION_ACK = 0x01;
     public static final int TRANSMIT_OPTION_AUTO_ROUTE = 0x04;
@@ -79,43 +94,52 @@ public class ZWaveController {
 
     private final ConcurrentHashMap<Integer, ZWaveNode> zwaveNodes = new ConcurrentHashMap<Integer, ZWaveNode>();
     private final ArrayList<ZWaveEventListener> zwaveEventListeners = new ArrayList<ZWaveEventListener>();
+    private final PriorityBlockingQueue<SerialMessage> sendQueue = new PriorityBlockingQueue<SerialMessage>(
+            INITIAL_TX_QUEUE_SIZE, new SerialMessage.SerialMessageComparator(this));
+    private final PriorityBlockingQueue<SerialMessage> recvQueue = new PriorityBlockingQueue<SerialMessage>(
+            INITIAL_RX_QUEUE_SIZE, new SerialMessage.SerialMessageComparator(this));
+    private ZWaveSendThread sendThread;
+    private ZWaveInputThread inputThread;
 
-    private int zWaveResponseTimeout = ZWAVE_RESPONSE_TIMEOUT; // TODO: Not currently used
+    private final Semaphore sendAllowed = new Semaphore(1);
+    private final Semaphore transactionCompleted = new Semaphore(1);
+    private volatile SerialMessage lastSentMessage = null;
+    private long lastMessageStartTime = 0;
+    private long longestResponseTime = 0;
+    private int zWaveResponseTimeout = ZWAVE_RESPONSE_TIMEOUT;
+    private Timer watchdog;
 
-    private String zwaveVersion = "Unknown";
+    private String zWaveVersion = "Unknown";
     private String serialAPIVersion = "Unknown";
     private int homeId = 0;
     private int ownNodeId = 0;
     private int manufactureId = 0;
     private int deviceType = 0;
     private int deviceId = 0;
-    private int zwaveLibraryType = 0;
+    private int ZWaveLibraryType = 0;
     private int sentDataPointer = 1;
-    private Integer sucNode = 0;
+    private boolean setSUC = false;
     private ZWaveDeviceType controllerType = ZWaveDeviceType.UNKNOWN;
     private int sucID = 0;
     private boolean softReset = false;
     private boolean masterController = true;
     private int secureInclusionMode = 0;
-    private String networkSecurityKey;
     private Set<SerialMessageClass> apiCapabilities = new HashSet<>();
 
-    private ZWaveInclusionController inclusionController = null;
     private int defaultWakeupPeriod = 0;
-
-    private final ZWaveTransactionManager transactionManager = new ZWaveTransactionManager(this);
 
     private AtomicInteger timeOutCount = new AtomicInteger(0);
 
     private ZWaveIoHandler ioHandler;
 
+    /**
+     * This is required for secure pairing. see {@link ZWaveSecurityCommandClass}
+     */
+    private ZWaveInclusionEvent lastIncludeSlaveFoundEvent;
+
     // Constructors
     public ZWaveController(ZWaveIoHandler handler) {
         this(handler, new HashMap<String, String>());
-    }
-
-    public void shutdown() {
-        transactionManager.shutdown();
     }
 
     /**
@@ -128,24 +152,23 @@ public class ZWaveController {
      */
     public ZWaveController(ZWaveIoHandler handler, Map<String, String> config) {
         masterController = "true".equals(config.get("masterController"));
-        sucNode = config.containsKey("sucNode") ? Integer.parseInt(config.get("sucNode")) : 0;
+        setSUC = "true".equals(config.get("isSUC"));
         softReset = "true".equals(config.get("softReset"));
         secureInclusionMode = config.containsKey("secureInclusion") ? Integer.parseInt(config.get("secureInclusion"))
                 : 0;
         final Integer timeout = config.containsKey("timeout") ? Integer.parseInt(config.get("timeout")) : 0;
 
-        networkSecurityKey = config.get("networkKey");
-
         defaultWakeupPeriod = config.containsKey("wakeupDefaultPeriod")
-                ? Integer.parseInt(config.get("wakeupDefaultPeriod"))
-                : 0;
+                ? Integer.parseInt(config.get("wakeupDefaultPeriod")) : 0;
 
         logger.info("Starting ZWave controller");
 
-        if (timeout >= 1500 && timeout <= 10000) {
+        if (timeout != null && timeout >= 1500 && timeout <= 10000) {
             zWaveResponseTimeout = timeout;
         }
         logger.info("ZWave timeout is set to {}ms. Soft reset is {}.", zWaveResponseTimeout, softReset);
+        // this.watchdog = new Timer(true);
+        // this.watchdog.schedule(new WatchDogTimerTask(), WATCHDOG_TIMER_PERIOD, WATCHDOG_TIMER_PERIOD);
 
         ioHandler = handler;
 
@@ -153,11 +176,19 @@ public class ZWaveController {
         // received before sending the init sequence. This avoids protocol errors (CAN errors).
         Timer initTimer = new Timer();
         initTimer.schedule(new InitializeDelayTask(), 3000);
+
+        sendThread = new ZWaveSendThread();
+        sendThread.start();
+        inputThread = new ZWaveInputThread();
+        inputThread.start();
     }
 
     private class InitializeDelayTask extends TimerTask {
         private final Logger logger = LoggerFactory.getLogger(InitializeDelayTask.class);
 
+        /**
+         * {@inheritDoc}
+         */
         @Override
         public void run() {
             logger.debug("Initialising network");
@@ -167,11 +198,6 @@ public class ZWaveController {
 
     // Incoming message handlers
 
-    public void handleTransactionComplete(ZWaveTransaction currentTransaction, SerialMessage responseMessage) {
-        notifyEventListeners(new ZWaveTransactionCompletedEvent(currentTransaction, responseMessage,
-                currentTransaction.getTransactionState() == TransactionState.DONE ? true : false));
-    }
-
     /**
      * Handles incoming Serial Messages. Serial messages can either be messages
      * that are a response to our own requests, or the stick asking us information.
@@ -179,16 +205,16 @@ public class ZWaveController {
      * @param incomingMessage
      *            the incoming message to process.
      */
-    public void handleIncomingMessage(ZWaveTransaction currentTransaction, SerialMessage incomingMessage) {
-        logger.debug("Incoming Message: {}", incomingMessage.toString());
+    private void handleIncomingMessage(SerialMessage incomingMessage) {
+        logger.debug(incomingMessage.toString());
 
         try {
             switch (incomingMessage.getMessageType()) {
-                case Response:
-                    handleIncomingResponseMessage(currentTransaction, incomingMessage);
-                    break;
                 case Request:
-                    handleIncomingRequestMessage(currentTransaction, incomingMessage);
+                    handleIncomingRequestMessage(incomingMessage);
+                    break;
+                case Response:
+                    handleIncomingResponseMessage(incomingMessage);
                     break;
                 default:
                     logger.warn("Unsupported incomingMessageType: {}", incomingMessage.getMessageType());
@@ -202,77 +228,97 @@ public class ZWaveController {
      * Handles an incoming request message. An incoming request message is a
      * message initiated by a node or the controller.
      *
-     * @param transaction
-     *            the transaction associated with this message
      * @param incomingMessage
      *            the incoming message to process.
      */
-    private void handleIncomingRequestMessage(ZWaveTransaction transaction, SerialMessage incomingMessage) {
+    private void handleIncomingRequestMessage(SerialMessage incomingMessage) {
         logger.trace("Incoming Message type = REQUEST");
 
         ZWaveCommandProcessor processor = ZWaveCommandProcessor.getMessageDispatcher(incomingMessage.getMessageClass());
         if (processor == null) {
-            logger.warn("TODO: Implement processing of Request Message = {} (0x{})",
-                    incomingMessage.getMessageClass() == null ? "--" : incomingMessage.getMessageClass(),
-                    Integer.toHexString(incomingMessage.getMessageClassKey()));
+            logger.warn(String.format("TODO: Implement processing of Request Message = %s (0x%02X)",
+                    incomingMessage.getMessageClass() == null ? "--" : incomingMessage.getMessageClass().getLabel(),
+                    incomingMessage.getMessageClassKey()));
 
             return;
         }
 
+        boolean result;
         try {
-            processor.handleRequest(this, transaction, incomingMessage);
+            result = processor.handleRequest(this, lastSentMessage, incomingMessage);
+            if (processor.isTransactionComplete()) {
+                notifyEventListeners(new ZWaveTransactionCompletedEvent(this.lastSentMessage, result));
+                transactionCompleted.release();
+                logger.trace("Released. Transaction completed permit count -> {}",
+                        transactionCompleted.availablePermits());
+            }
         } catch (ZWaveSerialMessageException e) {
-            logger.error("Exception processing frame", e);
+            // TODO Auto-generated catch block
+            e.printStackTrace();
         }
+    }
+
+    /**
+     * Handles a failed SendData request. This can either be because of the
+     * stick actively reporting it or because of a time-out of the transaction
+     * in the send thread.
+     *
+     * @param originalMessage
+     *            the original message that was sent
+     */
+    private void handleFailedSendDataRequest(SerialMessage originalMessage) {
+        new SendDataMessageClass().handleFailedSendDataRequest(this, originalMessage);
     }
 
     /**
      * Handles an incoming response message. An incoming response message is a
      * response, based one of our own requests.
      *
-     * @param transaction
-     *            the transaction associated with this message
      * @param incomingMessage
      *            the response message to process.
      */
-    private void handleIncomingResponseMessage(ZWaveTransaction transaction, SerialMessage incomingMessage)
-            throws ZWaveSerialMessageException {
+    private void handleIncomingResponseMessage(SerialMessage incomingMessage) throws ZWaveSerialMessageException {
         logger.trace("Incoming Message type = RESPONSE");
 
         ZWaveCommandProcessor processor = ZWaveCommandProcessor.getMessageDispatcher(incomingMessage.getMessageClass());
         if (processor == null) {
-            logger.warn("TODO: Implement processing of Response Message = {} (0x{})", incomingMessage.getMessageClass(),
-                    Integer.toHexString(incomingMessage.getMessageClass().getKey()));
+            logger.warn(String.format("TODO: Implement processing of Response Message = %s (0x%02X)",
+                    incomingMessage.getMessageClass().getLabel(), incomingMessage.getMessageClass().getKey()));
 
             return;
         }
 
-        processor.handleResponse(this, transaction, incomingMessage);
+        boolean result = processor.handleResponse(this, lastSentMessage, incomingMessage);
+        if (processor.isTransactionComplete()) {
+            notifyEventListeners(new ZWaveTransactionCompletedEvent(this.lastSentMessage, result));
+            transactionCompleted.release();
+            logger.trace("Released. Transaction completed permit count -> {}", transactionCompleted.availablePermits());
+        }
 
         switch (incomingMessage.getMessageClass()) {
             case GetVersion:
-                zwaveVersion = ((GetVersionMessageClass) processor).getVersion();
-                zwaveLibraryType = ((GetVersionMessageClass) processor).getLibraryType();
+                this.zWaveVersion = ((GetVersionMessageClass) processor).getVersion();
+                this.ZWaveLibraryType = ((GetVersionMessageClass) processor).getLibraryType();
                 break;
             case MemoryGetId:
-                ownNodeId = ((MemoryGetIdMessageClass) processor).getNodeId();
-                homeId = ((MemoryGetIdMessageClass) processor).getHomeId();
+                this.ownNodeId = ((MemoryGetIdMessageClass) processor).getNodeId();
+                this.homeId = ((MemoryGetIdMessageClass) processor).getHomeId();
                 break;
             case GetSucNodeId:
                 // Remember the SUC ID
                 sucID = ((GetSucNodeIdMessageClass) processor).getSucNodeId();
 
-                // If there is no SUC in the network, then assign us as SUC
-                if (sucNode == 0) {
-                    sucNode = getOwnNodeId();
-                    logger.debug("SUC was not defined - using controller (NODE {})", sucNode);
+                // If we want to be the SUC, enable it here
+                if (setSUC == true && sucID == 0) {
+                    // We want to be SUC
+                    enqueue(new EnableSucMessageClass().doRequest(EnableSucMessageClass.SUCType.SERVER));
+                    enqueue(new SetSucNodeMessageClass().doRequest(ownNodeId, SetSucNodeMessageClass.SUCType.SERVER));
+                } else if (setSUC == false && sucID == ownNodeId) {
+                    // We don't want to be SUC, but we currently are!
+                    // Disable SERVER functionality, and set the node to 0
+                    enqueue(new EnableSucMessageClass().doRequest(EnableSucMessageClass.SUCType.NONE));
+                    enqueue(new SetSucNodeMessageClass().doRequest(ownNodeId, SetSucNodeMessageClass.SUCType.NONE));
                 }
-
-                if (sucID != sucNode) {
-                    logger.debug("SUC was not set as required - currently {}, requires {}", sucID, sucNode);
-                    setSucNode(sucNode);
-                }
-
                 enqueue(new GetControllerCapabilitiesMessageClass().doRequest());
                 break;
             case GetControllerCapabilities:
@@ -288,26 +334,33 @@ public class ZWaveController {
                 enqueue(new SerialApiGetInitDataMessageClass().doRequest());
                 break;
             case SerialApiGetInitData:
-                List<Thread> initList = new ArrayList<Thread>();
+                // this.isConnected = true;
+                final List<Thread> initList = new ArrayList<Thread>();
                 for (Integer nodeId : ((SerialApiGetInitDataMessageClass) processor).getNodes()) {
                     initList.add(addNode(nodeId));
                 }
 
-                // Wait for all threads to complete starting initialisation before we advise the system
-                new ZWaveInitWaitThread(initList).start();
+                // Notify the system that we're up and running
+                new Thread() {
+                    @Override
+                    public void run() {
+                        for (Thread thread : initList) {
+                            try {
+                                logger.debug("Waiting for init thread {}", thread.getName());
+                                thread.join();
+                                logger.debug("Init thread {} complete", thread.getName());
+                            } catch (InterruptedException e) {
+                            }
+                        }
+                        logger.debug("All init threads complete");
+                        notifyEventListeners(new ZWaveNetworkStateEvent(true));
+                    }
+                }.start();
+
                 break;
             default:
                 break;
         }
-    }
-
-    /**
-     * Gets the home ID associated with the controller.
-     *
-     * @return the home ID
-     */
-    public int getHomeId() {
-        return homeId;
     }
 
     // Controller methods
@@ -318,7 +371,7 @@ public class ZWaveController {
      * @param nodeId
      */
     public void reinitialiseNode(int nodeId) {
-        zwaveNodes.remove(nodeId);
+        this.zwaveNodes.remove(nodeId);
         addNode(nodeId);
     }
 
@@ -332,44 +385,12 @@ public class ZWaveController {
         ZWaveEvent zEvent = new ZWaveInitializationStateEvent(nodeId, ZWaveNodeInitStage.EMPTYNODE);
         notifyEventListeners(zEvent);
 
-        // if (nodeId != 6) {
-        // return;
-        // }
-
         ioHandler.deviceDiscovered(nodeId);
         ZWaveInitNodeThread thread = new ZWaveInitNodeThread(this, nodeId);
         thread.setName("Node_" + nodeId + "_init");
         thread.start();
 
         return thread;
-    }
-
-    /**
-     * Thread to wait for all nodes to complete the init thread before notifying the system that we're alive.
-     * This ensures that all nodes exist in the system before application layers come online.
-     *
-     */
-    private class ZWaveInitWaitThread extends Thread {
-        List<Thread> initList;
-
-        ZWaveInitWaitThread(List<Thread> initList) {
-            this.initList = initList;
-        }
-
-        @Override
-        public void run() {
-            logger.debug("Starting waiting for init threads");
-            for (Thread thread : initList) {
-                try {
-                    logger.debug("Waiting for init thread {}", thread.getName());
-                    thread.join();
-                    logger.debug("Init thread {} complete", thread.getName());
-                } catch (InterruptedException e) {
-                }
-            }
-            logger.debug("All init threads complete");
-            notifyEventListeners(new ZWaveNetworkStateEvent(true));
-        }
     }
 
     private class ZWaveInitNodeThread extends Thread {
@@ -395,7 +416,7 @@ public class ZWaveController {
             ZWaveNode node = null;
             try {
                 ZWaveNodeSerializer nodeSerializer = new ZWaveNodeSerializer();
-                node = nodeSerializer.deserializeNode(homeId, nodeId);
+                node = nodeSerializer.DeserializeNode(nodeId);
             } catch (Exception e) {
                 logger.error("NODE {}: Restore from config: Error deserialising XML file. {}", nodeId, e.toString());
                 node = null;
@@ -416,8 +437,9 @@ public class ZWaveController {
                     node.setRestoredFromConfigfile(controller);
 
                     // Set the controller and node references for all command classes
-                    for (ZWaveCommandClass commandClass : node.getCommandClasses(0)) {
-                        commandClass.initialise(node, controller, null);
+                    for (ZWaveCommandClass commandClass : node.getCommandClasses()) {
+                        commandClass.setController(controller);
+                        commandClass.setNode(node);
 
                         // Handle event handlers
                         if (commandClass instanceof ZWaveEventListener) {
@@ -426,10 +448,12 @@ public class ZWaveController {
 
                         // If this is the multi-instance class, add all command classes for the endpoints
                         if (commandClass instanceof ZWaveMultiInstanceCommandClass) {
-                            for (int endpointNumber = 1; endpointNumber < node.getEndpointCount(); endpointNumber++) {
-                                ZWaveEndpoint endPoint = node.getEndpoint(endpointNumber);
+                            for (ZWaveEndpoint endPoint : ((ZWaveMultiInstanceCommandClass) commandClass)
+                                    .getEndpoints()) {
                                 for (ZWaveCommandClass endpointCommandClass : endPoint.getCommandClasses()) {
-                                    endpointCommandClass.initialise(node, controller, endPoint);
+                                    endpointCommandClass.setController(controller);
+                                    endpointCommandClass.setNode(node);
+                                    endpointCommandClass.setEndpoint(endPoint);
 
                                     // Handle event handlers
                                     if (endpointCommandClass instanceof ZWaveEventListener) {
@@ -437,11 +461,6 @@ public class ZWaveController {
                                     }
                                 }
                             }
-                        }
-
-                        // If this is the security command class, set the key
-                        if (commandClass instanceof ZWaveSecurityCommandClass) {
-                            ((ZWaveSecurityCommandClass) commandClass).setNetworkKey(networkSecurityKey);
                         }
                     }
                 }
@@ -479,70 +498,60 @@ public class ZWaveController {
         }
     }
 
-    public void sendPacket(SerialMessage message) {
-        ioHandler.sendPacket(message);
-    }
-
     /**
-     * Queues a message for sending on the send queue.
-     * This does not wait for a response.
+     * Enqueues a message for sending on the send queue.
      *
-     * @param transaction the {@link ZWaveMessagePayloadTransaction} message to enqueue.
+     * @param serialMessage
+     *            the serial message to enqueue.
      */
-    public void enqueue(ZWaveMessagePayloadTransaction transaction) {
+    public void enqueue(SerialMessage serialMessage) {
         // Sanity check!
-        if (transaction == null) {
-            logger.debug("Attempt to queue null message");
+        if (serialMessage == null) {
             return;
         }
 
-        transactionManager.queueTransactionForSend(transaction);
-    }
+        // First try and get the node
+        // If we're sending to a node, then this obviously isn't to the controller, and we should
+        // queue anything to a battery node (ie a node supporting the WAKEUP class)!
+        ZWaveNode node = this.getNode(serialMessage.getMessageNode());
+        if (node != null) {
+            // Keep track of the number of packets sent to this device
+            node.incrementSendCount();
 
-    /**
-     * Queues a message for sending on the nonce send queue.
-     * This does not wait for a response.
-     *
-     * @param transaction
-     *            the {@link ZWaveMessagePayloadTransaction} message to enqueue.
-     */
-    public void enqueueNonce(ZWaveMessagePayloadTransaction transaction) {
-        // Sanity check!
-        if (transaction == null) {
-            logger.debug("Attempt to queue null message");
-            return;
+            // Does this message need to be security encapsulated?
+            if (node.doesMessageRequireSecurityEncapsulation(serialMessage)) {
+                ZWaveSecurityCommandClass securityCommandClass = (ZWaveSecurityCommandClass) node
+                        .getCommandClass(CommandClass.SECURITY);
+                securityCommandClass.queueMessageForEncapsulationAndTransmission(serialMessage);
+                // The above call will call enqueue again with the encapsulated message,
+                // so we discard this one without putting it on the queue
+                return;
+            }
+
+            // If the device isn't listening, queue the message if it supports
+            // the wakeup class
+            if (!node.isListening() && !node.isFrequentlyListening()) {
+                ZWaveWakeUpCommandClass wakeUpCommandClass = (ZWaveWakeUpCommandClass) node
+                        .getCommandClass(CommandClass.WAKE_UP);
+
+                // If it's a battery operated device, check if it's awake or
+                // place in wake-up queue.
+                if (wakeUpCommandClass != null && !wakeUpCommandClass.processOutgoingWakeupMessage(serialMessage)) {
+                    return;
+                }
+            }
         }
 
-        transactionManager.queueNonceReportForSend(transaction);
+        // Add the message to the queue
+        this.sendQueue.add(serialMessage);
+        logger.debug("Message queued. Queue length = {}. Queue={}", this.sendQueue.size());// , this.sendQueue);
     }
 
     /**
-     * Queues a message for sending and returns the response once received.
-     *
-     * @param transaction
-     *            the {@link ZWaveMessagePayloadTransaction} message to enqueue.
+     * Returns the size of the send queue.
      */
-    public @Nullable ZWaveTransactionResponse sendTransaction(ZWaveMessagePayloadTransaction transaction) {
-        return transactionManager.sendTransaction(transaction);
-    }
-
-    /**
-     * Sets the SUC node ID. If the node ID is our node, then we enable server capabilities
-     *
-     * @param sucNodeId
-     */
-    public void setSucNode(int sucNodeId) {
-        if (sucNodeId < 1 || sucNodeId > 232) {
-            return;
-        }
-        enqueue(new SetSucNodeMessageClass().doRequest(sucNodeId, true));
-    }
-
-    /**
-     * Returns the size of the send queue for a specific node.
-     */
-    public int getSendQueueLength(int nodeId) {
-        return transactionManager.getSendQueueLength(nodeId);
+    public int getSendQueueLength() {
+        return this.sendQueue.size();
     }
 
     /**
@@ -552,18 +561,137 @@ public class ZWaveController {
      *            the event to send.
      */
     public void notifyEventListeners(ZWaveEvent event) {
-        logger.trace("Notifying event listeners: {}", event.getClass().getSimpleName());
+        logger.debug("Notifying event listeners: {}", event.getClass().getSimpleName());
         ArrayList<ZWaveEventListener> copy = new ArrayList<ZWaveEventListener>(zwaveEventListeners);
         for (ZWaveEventListener listener : copy) {
             listener.ZWaveIncomingEvent(event);
         }
 
-        // We also need to handle some events within the controller
-        if (event instanceof ZWaveNetworkEvent) {
+        // We also need to handle the inclusion internally within the controller
+        if (event instanceof ZWaveInclusionEvent) {
+            ZWaveInclusionEvent incEvent = (ZWaveInclusionEvent) event;
+            switch (incEvent.getEvent()) {
+                case IncludeSlaveFound:
+                    // When a device is found we get the IncludeSlaveFound notification.
+                    // Here we need to end inclusion.
+                    requestAddNodesStop();
+                    logger.debug("NODE {}: Including node.", incEvent.getNodeId());
+
+                    // First make sure this isn't an existing node
+                    if (getNode(incEvent.getNodeId()) != null) {
+                        logger.debug("NODE {}: Newly included node already exists - not initialising.",
+                                incEvent.getNodeId());
+                        break;
+                    }
+
+                    // TODO: This can be removed once the key is added to the security class directly
+                    // TODO: a few lines below.
+                    lastIncludeSlaveFoundEvent = incEvent;
+
+                    // Create a new node
+                    ZWaveNode newNode = new ZWaveNode(homeId, incEvent.getNodeId(), this);
+
+                    // Add the device class
+                    ZWaveDeviceClass deviceClass = newNode.getDeviceClass();
+                    deviceClass.setBasicDeviceClass(incEvent.getBasic());
+                    deviceClass.setGenericDeviceClass(incEvent.getGeneric());
+                    deviceClass.setSpecificDeviceClass(incEvent.getSpecific());
+
+                    // If we have the NIF as part of the inclusion, use it
+                    // TODO: This code now appears in multiple places - consolidate into the node
+                    for (CommandClass commandClass : incEvent.getCommandClasses()) {
+                        ZWaveCommandClass zwaveCommandClass = ZWaveCommandClass.getInstance(commandClass.getKey(),
+                                newNode, this);
+                        if (zwaveCommandClass != null) {
+                            logger.debug("NODE {}: Inclusion is adding command class {}.", incEvent.getNodeId(),
+                                    commandClass);
+                            // TODO: Add the network key to the security class
+                            if (commandClass == CommandClass.SECURITY) {
+                                // ((ZWaveSecurityCommandClass)zwaveCommandClass).setRealNetworkKey(hexString);
+                            }
+                            newNode.addCommandClass(zwaveCommandClass);
+                        }
+                    }
+
+                    // Place nodes in the local ZWave Controller
+                    zwaveNodes.putIfAbsent(incEvent.getNodeId(), newNode);
+                    break;
+
+                case IncludeDone:
+                    // Ignore node 0 - this just indicates inclusion finished
+                    if (incEvent.getNodeId() == 0) {
+                        break;
+                    }
+
+                    // Kick off the initialisation.
+                    // Since the node is awake, we jump straight into the initialisation sequence
+                    // without some of the initial stages like PING that are designed to detect if
+                    // the device is responding.
+                    // This is primarily designed to speed up the secure inclusion but is valid for all.
+                    // TODO: There's an assumption here that the whole NIF is provided with the inclusion method
+                    // -- we might want to keep an eye on this in case it's incorrect!
+                    ZWaveNode node = getNode(incEvent.getNodeId());
+                    if (node == null) {
+                        logger.debug("NODE {}: Newly included node doesn't exist - initialising from start.",
+                                incEvent.getNodeId());
+                        // Add the node using addNode()
+                        // This seems to happen if we exclude the node, then add it back in.
+                        // We don't get the IncludeSlaveFound notification, just the IncludeDone notification.
+                        addNode(incEvent.getNodeId());
+                        break;
+                    }
+
+                    // If this node is already initialising, then do nothing.
+                    // This might happen if a node is re-added even when we are aware of it
+                    if (node.getNodeInitStage() != ZWaveNodeInitStage.EMPTYNODE) {
+                        logger.debug("NODE {}: Newly included node already initialising at {}", incEvent.getNodeId(),
+                                node.getNodeInitStage());
+                        break;
+                    }
+
+                    // Start initialisation...
+                    // If we just included this through the IncludeSlaveFound, then we'll already know the device class
+                    if (node.getDeviceClass().getBasicDeviceClass() != Basic.NOT_KNOWN) {
+                        node.initialiseNode(ZWaveNodeInitStage.INCLUSION_START);
+                    } else {
+                        node.initialiseNode(ZWaveNodeInitStage.EMPTYNODE);
+                    }
+                    break;
+
+                case ExcludeDone:
+                    // Ignore node 0 - this just indicates exclusion finished
+                    if (incEvent.getNodeId() == 0) {
+                        break;
+                    }
+
+                    logger.debug("NODE {}: Excluding node.", incEvent.getNodeId());
+                    // Remove the node from the controller
+                    if (getNode(incEvent.getNodeId()) == null) {
+                        logger.debug("NODE {}: Excluding node that doesn't exist.", incEvent.getNodeId());
+                        break;
+                    }
+                    zwaveNodes.remove(incEvent.getNodeId());
+
+                    // Remove the XML file
+                    ZWaveNodeSerializer nodeSerializer = new ZWaveNodeSerializer();
+                    nodeSerializer.DeleteNode(event.getNodeId());
+                    break;
+                default:
+                    break;
+            }
+        } else if (event instanceof ZWaveNetworkEvent) {
             ZWaveNetworkEvent networkEvent = (ZWaveNetworkEvent) event;
             switch (networkEvent.getEvent()) {
                 case DeleteNode:
-                    removeNode(event.getNodeId());
+                    if (getNode(networkEvent.getNodeId()) == null) {
+                        logger.debug("NODE {}: Deleting a node that doesn't exist.", networkEvent.getNodeId());
+                        break;
+                    }
+                    this.zwaveNodes.remove(networkEvent.getNodeId());
+
+                    // Remove the XML file
+                    ZWaveNodeSerializer nodeSerializer = new ZWaveNodeSerializer();
+                    nodeSerializer.DeleteNode(event.getNodeId());
                     break;
                 default:
                     break;
@@ -587,21 +715,8 @@ public class ZWaveController {
                     break;
                 case ALIVE:
                     break;
-                default:
-                    break;
-            }
-        } else if (event instanceof ZWaveInclusionEvent) {
-            ZWaveInclusionEvent incEvent = (ZWaveInclusionEvent) event;
-
-            switch (incEvent.getEvent()) {
-                case ExcludeDone:
-                    removeNode(event.getNodeId());
-                    break;
-                default:
-                    break;
             }
         }
-
     }
 
     /**
@@ -628,6 +743,69 @@ public class ZWaveController {
     }
 
     /**
+     * Send Request Node info message to the controller.
+     *
+     * @param nodeId
+     *            the nodeId of the node to identify
+     *
+     */
+    public void requestNodeInfo(int nodeId) {
+        enqueue(new RequestNodeInfoMessageClass().doRequest(nodeId));
+    }
+
+    /**
+     * Polls a node for any dynamic information
+     *
+     * @param node
+     *
+     */
+    /*
+     * public void pollNode(ZWaveNode node) {
+     * for (ZWaveCommandClass zwaveCommandClass : node.getCommandClasses()) {
+     * logger.trace("NODE {}: Inspecting command class {}", node.getNodeId(),
+     * zwaveCommandClass.getCommandClass().getLabel());
+     * if (zwaveCommandClass instanceof ZWaveCommandClassDynamicState) {
+     * logger.debug("NODE {}: Found dynamic state command class {}", node.getNodeId(),
+     * zwaveCommandClass.getCommandClass().getLabel());
+     * ZWaveCommandClassDynamicState zdds = (ZWaveCommandClassDynamicState) zwaveCommandClass;
+     * int instances = zwaveCommandClass.getInstances();
+     * if (instances == 1) {
+     * Collection<SerialMessage> dynamicQueries = zdds.getDynamicValues(true);
+     * for (SerialMessage serialMessage : dynamicQueries) {
+     * sendData(serialMessage);
+     * }
+     * } else {
+     * for (int i = 1; i <= instances; i++) {
+     * Collection<SerialMessage> dynamicQueries = zdds.getDynamicValues(true);
+     * for (SerialMessage serialMessage : dynamicQueries) {
+     * sendData(node.encapsulate(serialMessage, zwaveCommandClass, i));
+     * }
+     * }
+     * }
+     * } else if (zwaveCommandClass instanceof ZWaveMultiInstanceCommandClass) {
+     * ZWaveMultiInstanceCommandClass multiInstanceCommandClass = (ZWaveMultiInstanceCommandClass) zwaveCommandClass;
+     * for (ZWaveEndpoint endpoint : multiInstanceCommandClass.getEndpoints()) {
+     * for (ZWaveCommandClass endpointCommandClass : endpoint.getCommandClasses()) {
+     * logger.trace("NODE {}: Inspecting command class {} for endpoint {}", node.getNodeId(),
+     * endpointCommandClass.getCommandClass().getLabel(), endpoint.getEndpointId());
+     * if (endpointCommandClass instanceof ZWaveCommandClassDynamicState) {
+     * logger.debug("NODE {}: Found dynamic state command class {}", node.getNodeId(),
+     * endpointCommandClass.getCommandClass().getLabel());
+     * ZWaveCommandClassDynamicState zdds2 = (ZWaveCommandClassDynamicState) endpointCommandClass;
+     * Collection<SerialMessage> dynamicQueries = zdds2.getDynamicValues(true);
+     * for (SerialMessage serialMessage : dynamicQueries) {
+     * sendData(node.encapsulate(serialMessage, endpointCommandClass,
+     * endpoint.getEndpointId()));
+     * }
+     * }
+     * }
+     * }
+     * }
+     * }
+     * }
+     */
+
+    /**
      * Request the node routing information.
      *
      * @param nodeId
@@ -635,7 +813,7 @@ public class ZWaveController {
      *
      */
     public void requestNodeRoutingInfo(int nodeId) {
-        enqueue(new GetRoutingInfoMessageClass().doRequest(nodeId));
+        this.enqueue(new GetRoutingInfoMessageClass().doRequest(nodeId));
     }
 
     /**
@@ -664,8 +842,8 @@ public class ZWaveController {
      *
      */
     public void requestAddNodesStart(int inclusionMode) {
-        if (inclusionController != null) {
-            logger.debug("ZWave inclusion process already running - aborted");
+        if (exclusion == true || inclusion == true) {
+            logger.debug("ZWave exclusion already in progress - aborted");
             return;
         }
 
@@ -693,8 +871,18 @@ public class ZWaveController {
                 break;
         }
 
-        inclusionController = new ZWaveInclusionController(this, networkSecurityKey);
-        inclusionController.startInclusion(highPower, networkWide);
+        enqueue(new AddNodeMessageClass().doRequestStart(highPower, networkWide));
+        inclusion = true;
+        startInclusionTimer();
+    }
+
+    /**
+     * Terminates the inclusion mode
+     *
+     */
+    private void requestAddNodesStop() {
+        enqueue(new AddNodeMessageClass().doRequestStop());
+        logger.debug("ZWave controller end inclusion");
     }
 
     /**
@@ -702,48 +890,14 @@ public class ZWaveController {
      *
      */
     public void requestRemoveNodesStart() {
-        if (inclusionController != null) {
-            logger.debug("ZWave inclusion process already running - aborted");
+        if (exclusion == true || inclusion == true) {
+            logger.debug("ZWave exclusion already in progress - aborted");
             return;
         }
-
-        inclusionController = new ZWaveInclusionController(this, networkSecurityKey);
-        inclusionController.startExclusion();
-    }
-
-    public void requestInclusionStop() {
-        if (inclusionController == null) {
-            logger.debug("ZWave inclusion process not running - nothing to do");
-            return;
-        }
-
-        inclusionController.stop();
-    }
-
-    protected void includeNode(ZWaveNode node) {
-        logger.debug("NODE {}: ZWaveController include node", node.getNodeId());
-        zwaveNodes.putIfAbsent(node.getNodeId(), node);
-
-        // If this node is already initialising, then do nothing.
-        // This might happen if a node is re-added even when we are already aware of it
-        if (node.getNodeInitStage() != ZWaveNodeInitStage.EMPTYNODE) {
-            logger.debug("NODE {}: Newly included node already initialising at {}", node.getNodeId(),
-                    node.getNodeInitStage());
-            return;
-        }
-
-        // Start initialisation...
-        // If we just included this through the IncludeSlaveFound, then we'll already know the device class
-        if (node.getDeviceClass().getBasicDeviceClass() != Basic.BASIC_TYPE_UNKNOWN) {
-            node.initialiseNode(ZWaveNodeInitStage.INCLUSION_START);
-        } else {
-            node.initialiseNode(ZWaveNodeInitStage.EMPTYNODE);
-        }
-    }
-
-    protected void includeDone() {
-        logger.debug("ZWaveController include done");
-        inclusionController = null;
+        enqueue(new RemoveNodeMessageClass().doRequestStart());
+        exclusion = true;
+        startInclusionTimer();
+        logger.debug("ZWave controller start exclusion");
     }
 
     /**
@@ -753,6 +907,75 @@ public class ZWaveController {
     public void requestRequestNetworkUpdate() {
         enqueue(new RequestNetworkUpdateMessageClass().doRequest());
         logger.debug("ZWave controller request network update");
+    }
+
+    /**
+     * Terminates the exclusion mode
+     *
+     */
+    private void requestRemoveNodesStop() {
+        enqueue(new RemoveNodeMessageClass().doRequestStop());
+        logger.debug("ZWave controller end exclusion");
+    }
+
+    /**
+     * Terminates inclusion or exclusion mode - which-ever is running
+     *
+     */
+    public void requestInclusionStop() {
+        stopInclusionTimer();
+    }
+
+    // The following timer class implements a re-triggerable timer to stop the inclusion
+    // mode after 30 seconds.
+    private Timer timer = new Timer();
+    private TimerTask timerTask = null;
+    private boolean inclusion = false;
+    private boolean exclusion = false;
+
+    private class InclusionTimerTask extends TimerTask {
+        @Override
+        public void run() {
+            logger.debug("Ending inclusion mode.");
+            stopInclusionTimer();
+        }
+    }
+
+    private synchronized void startInclusionTimer() {
+        // Stop any existing timer
+        if (timerTask != null) {
+            timerTask.cancel();
+        }
+
+        // Create the timer task
+        timerTask = new InclusionTimerTask();
+
+        // Start the timer for 30 seconds
+        timer.schedule(timerTask, 30000);
+    }
+
+    /**
+     * Stops any pending inclusion/exclusion.
+     * Resets flags, and signals to controller.
+     */
+    private synchronized void stopInclusionTimer() {
+        logger.debug("Stopping inclusion timer.");
+        if (inclusion) {
+            requestAddNodesStop();
+        } else if (exclusion) {
+            requestRemoveNodesStop();
+        } else {
+            logger.debug("Neither inclusion nor exclusion was active!");
+        }
+
+        inclusion = false;
+        exclusion = false;
+
+        // Stop the timer
+        if (timerTask != null) {
+            timerTask.cancel();
+            timerTask = null;
+        }
     }
 
     /**
@@ -766,8 +989,8 @@ public class ZWaveController {
      *
      */
     public void requestSoftReset() {
-        ZWaveSerialPayload msg = new SerialApiSoftResetMessageClass().doRequest();
-        // msg.attempts = 1;
+        SerialMessage msg = new SerialApiSoftResetMessageClass().doRequest();
+        msg.attempts = 1;
         enqueue(msg);
         logger.debug("ZWave controller soft reset");
     }
@@ -780,14 +1003,11 @@ public class ZWaveController {
     public void requestHardReset() {
         // Clear the queues
         // If we're resetting, there's no point in queuing messages!
-        // sendQueue.clear();
-        // recvQueue.clear();
+        sendQueue.clear();
+        recvQueue.clear();
 
-        // TODO: Clear RX queue as well?
-        transactionManager.clearSendQueue();
-
-        ZWaveSerialPayload msg = new ControllerSetDefaultMessageClass().doRequest();
-        // msg.attempts = 1;
+        SerialMessage msg = new ControllerSetDefaultMessageClass().doRequest();
+        msg.attempts = 1;
         enqueue(msg);
 
         // Clear all the nodes and we'll reinitialise
@@ -846,7 +1066,7 @@ public class ZWaveController {
      *            Destination node
      */
     public void requestAssignReturnRoute(int nodeId, int destinationId) {
-        enqueue(new AssignReturnRouteMessageClass().doRequest(nodeId, destinationId));
+        enqueue(new AssignReturnRouteMessageClass().doRequest(nodeId, destinationId, getCallbackId()));
     }
 
     /**
@@ -857,20 +1077,54 @@ public class ZWaveController {
      *            Source node
      */
     public void requestAssignSucReturnRoute(int nodeId) {
-        enqueue(new AssignSucReturnRouteMessageClass().doRequest(nodeId));
+        enqueue(new AssignSucReturnRouteMessageClass().doRequest(nodeId, getCallbackId()));
     }
 
     /**
-     * Transmits the {@link ZWaveCommandClassTransactionPayload} to a single ZWave Node.
+     * Returns the next callback ID
      *
-     * @param payload
-     *            the {@link ZWaveCommandClassTransactionPayload} message to send.
+     * @return callback ID
      */
-    public void sendData(ZWaveCommandClassTransactionPayload transaction) {
-        if (transaction == null) {
+    public int getCallbackId() {
+        if (++sentDataPointer > 0xFF) {
+            sentDataPointer = 1;
+        }
+        logger.trace("Callback ID = {}", sentDataPointer);
+
+        return sentDataPointer;
+    }
+
+    /**
+     * Transmits the SerialMessage to a single ZWave Node. Sets the transmission options as well.
+     *
+     * @param serialMessage
+     *            the Serial message to send.
+     */
+    public void sendData(SerialMessage serialMessage) {
+        if (serialMessage == null) {
             return;
         }
-        enqueue(transaction);
+        if (serialMessage.getMessageClass() != SerialMessageClass.SendData) {
+            logger.debug(String.format("Invalid message class %s (0x%02X) for sendData",
+                    serialMessage.getMessageClass().getLabel(), serialMessage.getMessageClass().getKey()));
+            return;
+        }
+        if (serialMessage.getMessageType() != SerialMessageType.Request) {
+            logger.debug("Only request messages can be sent");
+            return;
+        }
+
+        // We need to wait on the ACK from the controller before completing the transaction.
+        // This is required in case the Application Message is received from the SendData ACK
+        serialMessage.setAckRequired();
+
+        // ZWaveSecurityCommandClass needs to set it's own transmit options. Only set them here if not already done
+        if (!serialMessage.areTransmitOptionsSet()) {
+            serialMessage
+                    .setTransmitOptions(TRANSMIT_OPTION_ACK | TRANSMIT_OPTION_AUTO_ROUTE | TRANSMIT_OPTION_EXPLORE);
+        }
+        serialMessage.setCallbackId(getCallbackId());
+        enqueue(serialMessage);
     }
 
     /**
@@ -887,7 +1141,6 @@ public class ZWaveController {
                 return;
             }
             zwaveEventListeners.add(eventListener);
-            logger.debug("Event listener added.");
         }
     }
 
@@ -918,7 +1171,7 @@ public class ZWaveController {
      * @return the zWaveVersion
      */
     public String getZWaveVersion() {
-        return zwaveVersion;
+        return zWaveVersion;
     }
 
     /**
@@ -1008,33 +1261,15 @@ public class ZWaveController {
     }
 
     /**
-     * Gets the node object using it's node ID as key. Returns null if the node is not found
+     * Gets the node object using it's node ID as key. Returns null if the node
+     * is not found
      *
      * @param nodeId
      *            the Node ID of the node to get.
      * @return node object
      */
     public ZWaveNode getNode(int nodeId) {
-        return zwaveNodes.get(nodeId);
-    }
-
-    /**
-     * Removes the node object using it's node ID as key.
-     *
-     * @param nodeId the Node ID of the node to get.
-     */
-    public void removeNode(int nodeId) {
-        ZWaveNode node = getNode(nodeId);
-        if (node != null) {
-            node.close();
-            zwaveNodes.remove(nodeId);
-        } else {
-            logger.debug("NODE {}: Deleting a node that doesn't exist.", nodeId);
-        }
-
-        // Remove the XML file
-        ZWaveNodeSerializer nodeSerializer = new ZWaveNodeSerializer();
-        nodeSerializer.deleteNode(homeId, nodeId);
+        return this.zwaveNodes.get(nodeId);
     }
 
     /**
@@ -1043,7 +1278,7 @@ public class ZWaveController {
      * @return
      */
     public Collection<ZWaveNode> getNodes() {
-        return zwaveNodes.values();
+        return this.zwaveNodes.values();
     }
 
     /**
@@ -1057,9 +1292,224 @@ public class ZWaveController {
 
     // Nested classes and enumerations
 
+    /**
+     * Input thread. This processes incoming messages - it decouples the receive thread, which responds to messages from
+     * the controller, and the actual processing of messages to ensure we respond to the controller in a timely manner
+     *
+     * @author Chris Jackson
+     */
+    private class ZWaveInputThread extends Thread {
+        ZWaveInputThread() {
+            super("ZWaveInputThread");
+        }
+
+        /**
+         * Run method. Runs the actual receiving process.
+         */
+        @Override
+        public void run() {
+            logger.debug("Starting ZWave thread: Input");
+
+            SerialMessage recvMessage;
+            while (!interrupted()) {
+                try {
+                    if (recvQueue.size() == 0) {
+                        sendAllowed.release();
+                    }
+                    recvMessage = recvQueue.take();
+                    logger.debug("Receive queue TAKE: Length={}", recvQueue.size());
+                    logger.debug("Process Message = {}", SerialMessage.bb2hex(recvMessage.getMessageBuffer()));
+
+                    // logger.debug("Receive ---- do receive");
+                    handleIncomingMessage(recvMessage);
+                    // logger.debug("Receive ---- try acquire");
+                    sendAllowed.tryAcquire();
+                    // logger.debug("Receive ---- acquired");
+                } catch (InterruptedException e) {
+                    logger.error("Exception during ZWave thread: Input 1. {}", e);
+                    break;
+                } catch (Exception e) {
+                    logger.error("Exception during ZWave thread: Input 2. {}", e);
+                }
+            }
+
+            logger.debug("Stopped ZWave thread: Input");
+        }
+    }
+
+    /**
+     * ZWave controller Send Thread. Takes care of sending all messages. It uses a semaphore to synchronize
+     * communication with the receiving thread.
+     *
+     * @author Jan-Willem Spuij
+     * @author Chris Jackson
+     */
+    private class ZWaveSendThread extends Thread {
+
+        private final Logger logger = LoggerFactory.getLogger(ZWaveSendThread.class);
+
+        ZWaveSendThread() {
+            super("ZWaveSendThread");
+        }
+
+        /**
+         * Run method. Runs the actual sending process.
+         */
+        @Override
+        public void run() {
+            logger.debug("Starting ZWave thread: Send");
+            try {
+                while (!interrupted()) {
+                    // To avoid sending lots of frames when we still have input frames to process, we wait here until
+                    // we've processed all receive frames
+                    if (!sendAllowed.tryAcquire(1, zWaveResponseTimeout, TimeUnit.MILLISECONDS)) {
+                        sendAllowed.release();
+                        logger.warn("Receive queue TIMEOUT:", recvQueue.size());
+                        continue;
+                    }
+                    sendAllowed.release();
+
+                    // Take the next message from the send queue
+                    try {
+                        lastSentMessage = sendQueue.take();
+                        logger.debug("Took message from queue for sending. Queue length = {}", sendQueue.size());
+                    } catch (InterruptedException e) {
+                        logger.error("Send thread aborted!!!!!!!! {}", e);
+                        break;
+                    }
+
+                    // Check we got a message
+                    if (lastSentMessage == null) {
+                        continue;
+                    }
+
+                    // Get the node for this message
+                    ZWaveNode node = getNode(lastSentMessage.getMessageNode());
+
+                    // If it's a battery device, it needs to be awake, or we queue the frame until it is.
+                    if (node != null && !node.isListening() && !node.isFrequentlyListening()) {
+                        ZWaveWakeUpCommandClass wakeUpCommandClass = (ZWaveWakeUpCommandClass) node
+                                .getCommandClass(CommandClass.WAKE_UP);
+
+                        // If it's a battery operated device, check if it's awake or place in wake-up queue.
+                        if (wakeUpCommandClass != null
+                                && !wakeUpCommandClass.processOutgoingWakeupMessage(lastSentMessage)) {
+                            continue;
+                        }
+                    }
+
+                    // A transaction consists of (up to) 4 parts -:
+                    // 1) We send a REQUEST to the controller.
+                    // 2) The controller sends a RESPONSE almost immediately. This RESPONSE typically tells us that the
+                    // message was, or wasn't, added to the sticks queue.
+                    // 3) The controller sends a REQUEST once it's received the response from the device. We need to be
+                    // aware that there is no synchronization of messages between steps 2 and 3 so we can get other
+                    // messages received at step 3 that are not related to our original request.
+                    // 4) We ultimately receive the requested message from the device if we're requesting such a
+                    // message. Again, other messages can come in during this time.
+                    //
+                    // A transaction is generally completed at the completion of step 4.
+                    // However, for some messages, there may not be a further REQUEST so the transaction is terminated
+                    // at step 2. This is handled by the serial message class processor by setting transactionCompleted.
+                    //
+                    // It seems that some of these steps may occur out of order.
+                    // For example, the requested message at step 4 may be received before the REQUEST at step 3. This
+                    // can (I guess) occur if the message to the device is received by the device, but the ACK back to
+                    // the controller is lost. The device then sends the requested data, and then finally the ACK is
+                    // received. We cover this by setting an 'AckPending' flag in the sent message.
+                    // This needs to be cleared before the transaction is completed.
+
+                    // Clear the semaphore used to acknowledge the completed transaction.
+                    transactionCompleted.drainPermits();
+
+                    // Send the REQUEST message TO the controller
+                    ioHandler.sendPacket(lastSentMessage);
+                    lastMessageStartTime = System.currentTimeMillis();
+
+                    if (lastSentMessage instanceof SecurityEncapsulatedSerialMessage) {
+                        // Now that we've sent the encapsulated version, replace lastSentMessage with the original.
+                        // This is required because a resend requires a new nonce to be requested and a new
+                        // security encapsulated message to be built
+                        ((SecurityEncapsulatedSerialMessage) lastSentMessage).setTransmittedAt();
+                        // Take the callbackId from the encapsulated version and copy it to the original message
+                        int callbackId = lastSentMessage.getCallbackId();
+                        lastSentMessage = ((SecurityEncapsulatedSerialMessage) lastSentMessage)
+                                .getMessageBeingEncapsulated();
+                        lastSentMessage.setCallbackId(callbackId);
+                    }
+
+                    // Now wait for the RESPONSE, or REQUEST message FROM the controller
+                    // This will terminate when the transactionCompleted flag gets set
+                    // So, this might complete on a RESPONSE if there's an error (or no further REQUEST expected) or it
+                    // might complete on a subsequent REQUEST.
+                    try {
+                        if (!transactionCompleted.tryAcquire(1, zWaveResponseTimeout, TimeUnit.MILLISECONDS)) {
+                            timeOutCount.incrementAndGet();
+                            // If this is a SendData message, then we need to abort
+                            // This should only be sent if we didn't get the initial ACK!!!
+                            // So we need to check the ACK flag and only abort if it's not set
+                            if (lastSentMessage.getMessageClass() == SerialMessageClass.SendData
+                                    && lastSentMessage.isAckPending()) {
+                                SerialMessage serialMessage = new SerialMessage(SerialMessageClass.SendDataAbort,
+                                        SerialMessageType.Request, SerialMessageClass.SendData,
+                                        SerialMessagePriority.Immediate);
+                                logger.debug("NODE {}: Sending ABORT Message = {}", lastSentMessage.getMessageNode(),
+                                        SerialMessage.bb2hex(serialMessage.getMessageBuffer()));
+
+                                ioHandler.sendPacket(serialMessage);
+                            }
+
+                            // Check if we've exceeded the number of retries.
+                            // Requeue if we're ok, otherwise discard the message
+                            if (--lastSentMessage.attempts >= 0) {
+                                logger.debug("NODE {}: Timeout while sending message. Requeueing - {} attempts left!",
+                                        lastSentMessage.getMessageNode(), lastSentMessage.attempts);
+                                if (lastSentMessage.getMessageClass() == SerialMessageClass.SendData) {
+                                    handleFailedSendDataRequest(lastSentMessage);
+                                } else {
+                                    enqueue(lastSentMessage);
+                                }
+                            } else {
+                                logger.debug("NODE {}: Too many retries. Discarding message: {}",
+                                        lastSentMessage.getMessageNode(), lastSentMessage.toString());
+                            }
+                            continue;
+                        }
+                        long responseTime = System.currentTimeMillis() - lastMessageStartTime;
+                        if (responseTime > longestResponseTime) {
+                            longestResponseTime = responseTime;
+                        }
+                        logger.debug("NODE {}: Response processed after {}ms/{}ms.", lastSentMessage.getMessageNode(),
+                                responseTime, longestResponseTime);
+                        logger.trace("Acquired. Transaction completed permit count -> {}",
+                                transactionCompleted.availablePermits());
+                    } catch (InterruptedException e) {
+                        logger.error("Send thread aborted!!!!!!!! {}", e);
+                        break;
+                    }
+                }
+            } catch (Exception e) {
+                logger.error("Exception during ZWave thread: Send", e);
+            }
+            logger.debug("Stopped ZWave thread: Send");
+        }
+    }
+
     public void incomingPacket(SerialMessage packet) {
         // Add the packet to the receive queue
-        transactionManager.processReceiveMessage(packet);
+        recvQueue.add(packet);
+    }
+
+    /**
+     * This is required by {@link ZWaveSecurityCommandClass} for the secure pairing process.
+     * {@link ZWaveSecurityCommandClass} can't use the event handling because the
+     * object won't exist when this occurs, so we hold it here so {@link ZWaveSecurityCommandClass}
+     * can access it
+     *
+     * @return
+     */
+    public ZWaveInclusionEvent getLastIncludeSlaveFoundEvent() {
+        return lastIncludeSlaveFoundEvent;
     }
 
     /**
@@ -1069,9 +1519,5 @@ public class ZWaveController {
      */
     public int getSystemDefaultWakeupPeriod() {
         return defaultWakeupPeriod;
-    }
-
-    public String getSecurityKey() {
-        return networkSecurityKey;
     }
 }
